@@ -1,0 +1,195 @@
+================================================================================
+  ORACLE 19c+ DATA GUARD ENVIRONMENT REBOOT STEPS
+  Physical Standby (Non-Broker) | Step-by-Step Procedure
+================================================================================
+
+OVERVIEW
+--------
+This guide covers the safe shutdown and restart of an Oracle 19c+ Data Guard
+environment (Primary + Physical Standby) for OS-level maintenance or patching.
+
+ASSUMPTIONS
+-----------
+  - Single-instance setup (non-RAC)
+  - Physical standby database
+  - log_archive_dest_2 is used for log shipping to the standby
+  - Active Data Guard (ADG / read-only open) steps are marked as OPTIONAL
+    and require a separate Oracle Active Data Guard license
+
+================================================================================
+  PHASE 1 — PRE-SHUTDOWN
+================================================================================
+
+STEP 1: Primary — Defer log shipping and shut down
+----------------------------------------------------
+Connect as SYSDBA on the primary node:
+
+  $ sqlplus / as sysdba
+
+  SQL> ALTER SYSTEM SET log_archive_dest_state_2 = 'DEFER';
+  SQL> SHUTDOWN IMMEDIATE;
+  SQL> EXIT;
+
+Then stop the listener:
+
+  $ lsnrctl stop
+
+
+STEP 2: Standby — Cancel MRP and shut down
+--------------------------------------------
+Connect as SYSDBA on the standby node:
+
+  $ sqlplus / as sysdba
+
+  SQL> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+  SQL> SHUTDOWN IMMEDIATE;
+  SQL> EXIT;
+
+Then stop the listener:
+
+  $ lsnrctl stop
+
+
+================================================================================
+  PHASE 2 — OS MAINTENANCE
+================================================================================
+
+  - Apply OS patches / updates
+  - Reboot the OS on both nodes (standby first, then primary — or as required)
+  - Wait for both nodes to come back up fully before proceeding
+
+
+================================================================================
+  PHASE 3 — POST-RESTART STARTUP
+================================================================================
+
+NOTE: Start the PRIMARY first, then the STANDBY.
+
+------------------------------------------------------------------------
+STEP 3: Primary — Start listener, database, and re-enable log shipping
+------------------------------------------------------------------------
+
+  $ lsnrctl start
+
+  $ sqlplus / as sysdba
+
+  SQL> STARTUP;
+
+  -- Force dynamic listener registration (good practice after restart):
+  SQL> ALTER SYSTEM REGISTER;
+
+  -- Re-enable log shipping to the standby:
+  SQL> ALTER SYSTEM SET log_archive_dest_state_2 = 'ENABLE';
+
+  SQL> EXIT;
+
+
+------------------------------------------------------------------------
+STEP 4: Standby — Start listener and bring up managed recovery
+------------------------------------------------------------------------
+
+  $ lsnrctl start
+
+  $ sqlplus / as sysdba
+
+  -- Initialize the instance (no database files opened yet):
+  SQL> STARTUP NOMOUNT;
+
+  -- Mount in standby mode to accept redo from the primary:
+  SQL> ALTER DATABASE MOUNT STANDBY DATABASE;
+
+  -- [OPTIONAL — Active Data Guard / ADG license required]
+  -- Open the standby read-only for reporting/queries while MRP runs:
+  SQL> ALTER DATABASE OPEN READ ONLY;
+
+  -- Start the Managed Recovery Process (MRP) with real-time apply.
+  -- "USING CURRENT LOGFILE" enables real-time apply (recommended in 19c+).
+  -- "DISCONNECT FROM SESSION" runs MRP as a background process:
+  SQL> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+         USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+  SQL> EXIT;
+
+
+================================================================================
+  PHASE 4 — VERIFICATION
+================================================================================
+
+Run these queries on the STANDBY to confirm synchronisation is healthy:
+
+  $ sqlplus / as sysdba
+
+  -- Confirm the database role and open mode:
+  SQL> SELECT NAME, DB_UNIQUE_NAME, DATABASE_ROLE, OPEN_MODE
+         FROM V$DATABASE;
+
+  -- Confirm MRP is running and applying logs:
+  SQL> SELECT PROCESS, STATUS, SEQUENCE#
+         FROM V$MANAGED_STANDBY
+        WHERE PROCESS LIKE 'MRP%';
+
+  -- Cross-check log sequences (run same query on primary to compare):
+  SQL> SELECT MAX(SEQUENCE#), APPLIED
+         FROM V$ARCHIVED_LOG
+        GROUP BY APPLIED;
+
+  -- Check for any Data Guard errors:
+  SQL> SELECT MESSAGE, TIMESTAMP
+         FROM V$DATAGUARD_STATUS
+        ORDER BY TIMESTAMP DESC
+        FETCH FIRST 20 ROWS ONLY;
+
+  SQL> EXIT;
+
+Expected healthy output:
+  - DATABASE_ROLE  = PHYSICAL STANDBY
+  - OPEN_MODE      = MOUNTED  (or READ ONLY WITH APPLY if ADG is licensed)
+  - MRP0 process   = STATUS: APPLYING_LOG
+
+
+================================================================================
+  QUICK REFERENCE CHEAT SHEET
+================================================================================
+
+  ACTION                          PRIMARY                     STANDBY
+  --------------------------      -------------------------   -------------------------
+  Defer/cancel before shutdown    SET dest_state_2=DEFER      CANCEL MRP
+  Shutdown                        SHUTDOWN IMMEDIATE          SHUTDOWN IMMEDIATE
+  Stop listener                   lsnrctl stop                lsnrctl stop
+  --- OS reboot ---
+  Start listener                  lsnrctl start               lsnrctl start
+  Start DB                        STARTUP                     STARTUP NOMOUNT
+  Mount                           (auto on STARTUP)           ALTER DB MOUNT STANDBY DB
+  Open (ADG, optional)            n/a                         ALTER DB OPEN READ ONLY
+  Enable shipping / start MRP     SET dest_state_2=ENABLE     RECOVER ... USING CURRENT
+                                                              LOGFILE DISCONNECT
+
+
+================================================================================
+  NOTES
+================================================================================
+
+  [1] SHUTDOWN IMMEDIATE vs SHUTDOWN ABORT
+      Always prefer SHUTDOWN IMMEDIATE for a controlled shutdown.
+      SHUTDOWN ABORT should be a last resort as it requires instance recovery
+      on next startup.
+
+  [2] Real-time apply ("USING CURRENT LOGFILE")
+      This is the recommended MRP mode for Oracle 19c+. It applies redo from
+      the standby redo logs (SRLs) in real time — before they are archived —
+      minimising the apply lag compared to archived log-only apply.
+
+  [3] Active Data Guard (ADG) licensing
+      Opening the standby READ ONLY while MRP is running requires an Active
+      Data Guard license. Omit the "ALTER DATABASE OPEN READ ONLY" step if
+      you are not licensed for ADG. Without it the standby stays in MOUNTED
+      state, which is fully valid for DR purposes.
+
+  [4] If using Oracle Restart (SRVCTL)
+      Replace the manual startup commands with:
+        srvctl start database -d <db_unique_name> -o mount     (standby)
+        srvctl start database -d <db_unique_name>               (primary)
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
