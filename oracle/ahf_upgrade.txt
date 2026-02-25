@@ -1,0 +1,63 @@
+Move Autonomus Health Framework latest zip file to the server. After that, move the file to staging area (default: /opt/local) as root user:
+
+cd /opt/local
+mv /home/myuser/AHF-LINUX_v24.9.0.zip .
+
+Set the current policy as follows:
+
+[root@MYSERVER local]# ahfctl setupgrade -all
+
+Enter autoupgrade flag <on/off> : on
+Enter software stage location : /opt/local
+Enter auto upgrade frequency : 30
+AHF autoupgrade parameters successfully updated
+Successfully synced AHF configuration
+refreshConfig() completed successfully.
+[root@MYSERVER local]# ahfctl upgrade
+
+Upgrade the current ahf with the comand below:
+
+[root@MYSERVER local]# ahfctl upgrade
+
+Initiating Autonomous Health Framework (AHF) auto upgrade
+/opt/local/AHF-LINUX_v24.9.0.zip found at stage location: /opt/local
+/opt/local/AHF-LINUX_v24.9.0.zip successfully extracted at /opt/local
+AHF software signature has been validated successfully
+Starting to upgrade Autonomous Health Framework (AHF) from 2406000_202407021318 to 2409000_202409291610
+
+
+AHF Installer for Platform Linux Architecture x86_64
+
+AHF Installation Log : /tmp/ahf_install_249000_822645_2024_10_31-15_57_52.log
+
+Starting Autonomous Health Framework (AHF) Installation
+
+AHF Version: 24.9.0 Build Date: 202409291610
+
+AHF is already installed at /opt/oracle.ahf
+
+Installed AHF Version: 24.6.0 Build Date: 202407021318
+
+Upgrading /opt/oracle.ahf
+
+Shutting down AHF Services
+
+Upgrading AHF Services
+
+Starting AHF Services
+
+.----------------------------------------------------------------------.
+| Host          | TFA Version | TFA Build ID          | Upgrade Status |
++---------------+-------------+-----------------------+----------------+
+| MYSERVER |  24.9.0.0.0 | 240900020240929161050 | UPGRADED       |
+'---------------+-------------+-----------------------+----------------'
+
+Setting up AHF CLI and SDK
+
+AHF is successfully upgraded to latest version
+
+Moving /tmp/ahf_install_249000_822645_2024_10_31-15_57_52.log to /opt/oracle.ahf/data/MYSERVER/diag/ahf/
+
+Autonomous Health Framework (AHF) successfully upgraded from 2406000_202407021318 to 2409000_202409291610
+
+Check if /opt/local is cleaned from zip file. Also after upgrade it may ask e-mail, user for auto upgrade endpoint but its not important, just close it via CTRL-C or CTRL-X (since your server is not connected to internet)
