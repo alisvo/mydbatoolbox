@@ -88,7 +88,7 @@ send_alert() {
 cd "$ORACLE_BASE" || exit 1
 
 # 1. Run SQLPlus
-sqlplus -s / as sysdba @monitoring_v2.sql > "$DB_LOG" 2>&1
+sqlplus -s / as sysdba @monitoring.sql > "$DB_LOG" 2>&1
 
 # 2. Process Results
 send_alert "[Warning] DB Health Alert: $ORACLE_SID" "$DB_LOG"
