@@ -1,0 +1,24 @@
+-- PostgreSQL: Granting Default Privileges for a Read/Write Role
+
+-- 1. Create a new group role without direct login permissions
+CREATE ROLE app_rw_role NOLOGIN;
+
+-- 2. Grant basic connection and schema usage rights
+GRANT CONNECT ON DATABASE app_database TO app_rw_role;
+GRANT USAGE ON SCHEMA public TO app_rw_role;
+
+-- 3. Grant privileges on EXISTING objects
+-- Allow CRUD operations on all currently existing tables
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_rw_role;
+
+-- Allow usage of existing sequences (Required for INSERT operations)
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_rw_role;
+
+-- 4. Set DEFAULT PRIVILEGES for FUTURE objects
+-- Automatically grant permissions on any NEW tables created by "app_admin_user"
+ALTER DEFAULT PRIVILEGES FOR ROLE "app_admin_user" IN SCHEMA public 
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw_role;
+
+-- Automatically grant permissions on any NEW sequences created by "app_admin_user"
+ALTER DEFAULT PRIVILEGES FOR ROLE "app_admin_user" IN SCHEMA public 
+GRANT USAGE, SELECT ON SEQUENCES TO app_rw_role;
