@@ -1,0 +1,11 @@
+c:\>impdp system/passwd@exampledb directory=DUMPS dumpfile=example.dmp logfile=example-imp.log
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+ORA-39001: invalid argument value
+ORA-39000: bad dump file specification
+ORA-39155: error expanding dump file name "\\storage\dir\example.dmp"
+ORA-48128: opening of a symbolic link is disallowed
+
+
+ALTER SYSTEM SET "_disable_directory_link_check" = TRUE SCOPE=SPFILE;
+
+Source: <https://dba.stackexchange.com/questions/241448/oracle-database-19-3-on-windows-howto-impdp-or-expdp-from-a-unc-path-in-windows> 
