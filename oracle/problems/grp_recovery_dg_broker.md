@@ -118,6 +118,14 @@ dgmgrl sys/Oracle123@oracle1
 DGMGRL> SHOW DATABASE PRIDBSTBY;
 ```
 *(You will see the status briefly change to flashing back, and then return to "Applying Redo".)*
+*(Check the alert log and you may see something like below, this means it's synced.)*
+
+```
+2026-03-26T10:11:33.329988+03:00
+PR00 (PID:6877): Media Recovery Waiting for T-1.S-2 (in transit)
+2026-03-26T10:11:33.409136+03:00
+Recovery of Online Redo Log: Thread 1 Group 5 Seq 2 Reading mem 0
+```
 
 ### Step 7 — Re-open Standby to Active Data Guard (Optional)
 Once the auto-flashback completes and apply resumes, you can return the standby to Active Data Guard (READ ONLY WITH APPLY) using the proper Broker workflow.
