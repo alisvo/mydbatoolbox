@@ -1,0 +1,25 @@
+SELECT
+    TO_CHAR(sn.begin_interval_time, 'YYYY-MM-DD') AS tarih,
+    ROUND(SUM(su.tablespace_size * dt.block_size) / 1024 / 1024 / 1024, 2) AS tahsis_edilen_boyut_gb,
+    ROUND(SUM(su.tablespace_usedsize * dt.block_size) / 1024 / 1024 / 1024, 2) AS kullanilan_boyut_gb
+FROM
+    dba_hist_tbspc_space_usage su
+JOIN
+    dba_hist_snapshot sn ON su.snap_id = sn.snap_id
+JOIN
+    v$tablespace vt ON su.tablespace_id = vt.ts#
+JOIN
+    dba_tablespaces dt ON vt.name = dt.tablespace_name
+WHERE
+    -- Her günün sadece en son snapshot'ını dahil et (gece yarısına en yakın olan)
+    sn.snap_id IN (
+        SELECT MAX(snap_id)
+        FROM dba_hist_snapshot
+        GROUP BY TRUNC(begin_interval_time)
+    )
+    -- Eğer RAC (Real Application Clusters) kullanıyorsanız mükerrer kayıtları önlemek için:
+    AND sn.instance_number = 1
+GROUP BY
+    TO_CHAR(sn.begin_interval_time, 'YYYY-MM-DD')
+ORDER BY
+    tarih;
