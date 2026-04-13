@@ -1,0 +1,5 @@
+Aşağıdaki parametrelerin set edilmesinden sonra query insight'lar açılabilir:
+
+pg_qs.query_capture_mode => all or top
+pgms_wait_sampling.query_capture_mode => all
+track_io_timing => on
