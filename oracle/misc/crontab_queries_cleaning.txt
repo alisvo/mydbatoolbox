@@ -1,0 +1,18 @@
+Every ORACLE instance working under a filesystem should have these in general.
+
+#Auto start script
+@reboot /home/oracle/scripts/db_start.sh > /home/oracle/scripts/db_start_cron.log 2>&1
+
+#Level0-1-Archive Log RMAN BAckups
+30 22 * * *   sh /home/oracle/rman_scripts/Level01_MYDB.sh > /dev/null 2>&1
+0 */3 * * *  sh /home/oracle/rman_scripts/LevelARC_MYDB.sh > /dev/null 2>&1
+
+#dba monitoring that sends email periodically if something happens wrong
+0,30 * * * * /home/oracle/scripts/monitoring/monitoring.sh MYDB >> /home/oracle/scripts/monitoring/log/monitoring_$(date +\%Y\%m\%d).log 2>&1
+
+#delete  accumulating log data
+15 * * * * /usr/bin/find /home/oracle/scripts/log -type f -mtime +1 -delete
+5 * * * * /usr/bin/find /home/oracle/scripts/monitoring/log -type f -mtime +1 -delete
+
+#daily jobs for database
+27 12 * * * /home/oracle/scripts/important_jobs/importantjob1.sh > /home/oracle/scripts/important_jobs/importantjob1.log 2>&1
