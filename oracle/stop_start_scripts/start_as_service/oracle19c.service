@@ -1,0 +1,22 @@
+[Unit]
+Description=Oracle 19c Database and Listener Service
+After=network.target local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=oracle
+Group=oinstall
+
+ExecStart=/usr/local/bin/oracle_ctl.sh start
+ExecStop=/usr/local/bin/oracle_ctl.sh stop
+
+# CRITICAL SAFEGUARDS:
+# Give Oracle up to 15 minutes to perform a clean shutdown
+TimeoutStopSec=15min
+# Never allow systemd to forcefully kill PMON/SMON if it times out
+SendSIGKILL=no
+KillMode=none
+
+[Install]
+WantedBy=multi-user.target
