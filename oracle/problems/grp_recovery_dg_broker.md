@@ -159,4 +159,3 @@ EOF
 
 ---
 
-Would you like me to write up a quick cheat sheet for common `dgmgrl` commands to append to the bottom of your runbook for future reference?
