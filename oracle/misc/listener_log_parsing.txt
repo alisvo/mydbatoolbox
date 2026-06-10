@@ -1,0 +1,4 @@
+cd $ORACLE_BASE/diag/tnslsnr/$(hostname)/listener/trace/ && perl -ne 'if (/establish/ && /^[0-9]{2}-(MAR|MAY|JUN)-2026/) { my ($user) = /USER=([^)]+)/; my ($prog) = /PROGRAM=([^)]+)/; my @hosts = /HOST=([^)]+)/g; $user ||= "UNKNOWN"; $prog ||= "UNKNOWN"; my $cli_host = $hosts[0] || "UNKNOWN"; my $net_ip = $hosts[1] || $hosts[0]; printf "%-15s\t%-15s\t%-20s\t%s\n", $user, $net_ip, $cli_host, $prog; }' listener.log | sort -u
+
+
+--Bu komut listener logunu MAYIS-HAZIRAN için alır ve kimlerin bağlandığını distinct olarak cıkarır.
