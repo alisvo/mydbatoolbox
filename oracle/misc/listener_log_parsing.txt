@@ -2,3 +2,8 @@ cd $ORACLE_BASE/diag/tnslsnr/$(hostname)/listener/trace/ && perl -ne 'if (/estab
 
 
 --Bu komut listener logunu MAYIS-HAZIRAN için alır ve kimlerin bağlandığını distinct olarak cıkarır.
+
+
+perl -ne 'if (/establish/ && /^[0-9]{2}-(MAR|APR|MAY|JUN)-2026/) { my @hosts = /HOST=([^)]+)/g; my $net_ip = $hosts[1] || $hosts[0]; print "$net_ip\n"; }' listener.log | sort -u
+
+--Bu komut da sadece ip'leri verir.
