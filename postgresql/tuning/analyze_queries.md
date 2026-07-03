@@ -201,10 +201,10 @@ LIMIT 10;
 Örneğin sadece `2026-07-01 20:00` ile `2026-07-02 02:00` arasındaki en pahalı sorguları görmek için:
 
 ```sql
-WITH params AS (
+	WITH params AS (
     SELECT
-        '2026-07-01 20:00:00'::timestamp AS from_ts,
-        '2026-07-02 02:00:00'::timestamp AS to_ts
+        '2026-07-02 15:00:00'::timestamp AS from_ts,
+        '2026-07-03 00:00:00'::timestamp AS to_ts
 )
 SELECT 
     q.query_id,
@@ -213,7 +213,8 @@ SELECT
     ROUND((SUM(q.total_time) / NULLIF(SUM(q.calls), 0))::numeric, 2) AS agirlikli_ortalama_sure_ms,
     ROUND(MAX(q.max_time)::numeric, 2) AS en_yuksek_sure_ms,
     MIN(q.start_time) AS ilk_gorulen_zaman,
-    MAX(q.end_time) AS son_gorulen_zaman
+    MAX(q.end_time) AS son_gorulen_zaman,
+	q.query_sql_text 
 FROM query_store.qs_view q
 CROSS JOIN params p
 WHERE q.end_time >= p.from_ts
