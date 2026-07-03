@@ -1,113 +1,125 @@
 WITH
-	PARAMS AS (
-		SELECT
-			LOCALTIMESTAMP - INTERVAL '3 days' AS FROM_TS,
-			LOCALTIMESTAMP AS TO_TS
-	),
-	BASE AS (
-		SELECT
-			QV.DB_ID,
-			QV.USER_ID,
-			QV.QUERY_ID,
-			COUNT(DISTINCT QV.PLAN_ID) AS PLAN_COUNT,
-			STRING_AGG(
-				DISTINCT QV.PLAN_ID::TEXT,
-				', '
-				ORDER BY
-					QV.PLAN_ID::TEXT
-			) AS PLAN_IDS,
-			MIN(QV.START_TIME) AS FIRST_SEEN,
-			MAX(QV.END_TIME) AS LAST_SEEN,
-			SUM(QV.CALLS) AS CALLS,
-			SUM(QV.TOTAL_TIME) AS TOTAL_EXEC_MS,
-			SUM(
-				GREATEST(
-					QV.TOTAL_TIME - COALESCE(QV.BLK_READ_TIME, 0) - COALESCE(QV.BLK_WRITE_TIME, 0),
-					0
-				)
-			) AS APPROX_CPU_MS,
-			SUM(
-				COALESCE(QV.BLK_READ_TIME, 0) + COALESCE(QV.BLK_WRITE_TIME, 0)
-			) AS IO_TIME_MS,
-			SUM(QV.ROWS) AS TOTAL_ROWS,
-			SUM(QV.SHARED_BLKS_HIT) AS SHARED_BLKS_HIT,
-			SUM(QV.SHARED_BLKS_READ) AS SHARED_BLKS_READ,
-			SUM(QV.SHARED_BLKS_DIRTIED) AS SHARED_BLKS_DIRTIED,
-			SUM(QV.SHARED_BLKS_WRITTEN) AS SHARED_BLKS_WRITTEN,
-			SUM(QV.TEMP_BLKS_READ) AS TEMP_BLKS_READ,
-			SUM(QV.TEMP_BLKS_WRITTEN) AS TEMP_BLKS_WRITTEN,
-			MIN(QV.MIN_TIME) AS MIN_EXEC_MS,
-			MAX(QV.MAX_TIME) AS MAX_EXEC_MS,
-			MAX(QV.QUERY_TYPE) AS QUERY_TYPE,
-			REGEXP_REPLACE(MAX(QV.QUERY_SQL_TEXT), '\s+', ' ', 'g') AS QUERY_TEXT
-		FROM
-			QUERY_STORE.QS_VIEW QV
-			CROSS JOIN PARAMS P
-		WHERE
-			QV.END_TIME > P.FROM_TS
-			AND QV.START_TIME < P.TO_TS
-			AND QV.IS_SYSTEM_QUERY IS FALSE
-		GROUP BY
-			QV.DB_ID,
-			QV.USER_ID,
-			QV.QUERY_ID
-	),
-	TOTALS AS (
-		SELECT
-			SUM(TOTAL_EXEC_MS) AS WORKLOAD_EXEC_MS,
-			SUM(APPROX_CPU_MS) AS WORKLOAD_APPROX_CPU_MS
-		FROM
-			BASE
-	)
+    params AS (
+        SELECT
+            LOCALTIMESTAMP - INTERVAL '3 days' AS from_ts,
+            LOCALTIMESTAMP AS to_ts
+
+            -- Örnek sabit tarih aralığı kullanmak istersen:
+            -- '2026-07-02 15:00:00'::timestamp AS from_ts,
+            -- '2026-07-03 00:00:00'::timestamp AS to_ts
+    ),
+    base AS (
+        SELECT
+            qv.db_id,
+            qv.user_id,
+            qv.query_id,
+
+            COUNT(DISTINCT qv.plan_id) AS plan_count,
+            STRING_AGG(
+                DISTINCT qv.plan_id::text,
+                ', '
+                ORDER BY qv.plan_id::text
+            ) AS plan_ids,
+
+            MIN(qv.start_time) AS first_seen,
+            MAX(qv.end_time) AS last_seen,
+
+            SUM(qv.calls) AS calls,
+            SUM(qv.total_time) AS total_exec_ms,
+
+            SUM(qv.rows) AS total_rows,
+
+            SUM(qv.shared_blks_hit) AS shared_blks_hit,
+            SUM(qv.shared_blks_read) AS shared_blks_read,
+            SUM(qv.shared_blks_dirtied) AS shared_blks_dirtied,
+            SUM(qv.shared_blks_written) AS shared_blks_written,
+
+            SUM(qv.temp_blks_read) AS temp_blks_read,
+            SUM(qv.temp_blks_written) AS temp_blks_written,
+
+            SUM(COALESCE(qv.blk_read_time, 0)) AS blk_read_time_ms,
+            SUM(COALESCE(qv.blk_write_time, 0)) AS blk_write_time_ms,
+
+            MIN(qv.min_time) AS min_exec_ms,
+            MAX(qv.max_time) AS max_exec_ms,
+
+            MAX(qv.query_type) AS query_type,
+            REGEXP_REPLACE(MAX(qv.query_sql_text), '\s+', ' ', 'g') AS query_text
+        FROM
+            query_store.qs_view qv
+            CROSS JOIN params p
+        WHERE
+            qv.end_time > p.from_ts
+            AND qv.start_time < p.to_ts
+            AND qv.is_system_query IS FALSE
+        GROUP BY
+            qv.db_id,
+            qv.user_id,
+            qv.query_id
+    ),
+    totals AS (
+        SELECT
+            SUM(total_exec_ms) AS workload_exec_ms
+        FROM
+            base
+    )
 SELECT
-	COALESCE(D.DATNAME, B.DB_ID::TEXT) AS DATABASE_NAME,
-	COALESCE(R.ROLNAME, B.USER_ID::TEXT) AS USER_NAME,
-	B.QUERY_ID,
-	B.QUERY_TYPE,
-	B.PLAN_COUNT,
-	B.PLAN_IDS,
-	B.FIRST_SEEN,
-	B.LAST_SEEN,
-	B.CALLS,
-	ROUND((B.TOTAL_EXEC_MS / 1000.0)::NUMERIC, 2) AS TOTAL_EXEC_SEC,
-	ROUND(
-		(
-			100.0 * B.TOTAL_EXEC_MS / NULLIF(T.WORKLOAD_EXEC_MS, 0)
-		)::NUMERIC,
-		2
-	) AS EXEC_TIME_PCT_OF_WORKLOAD,
-	ROUND((B.APPROX_CPU_MS / 1000.0)::NUMERIC, 2) AS APPROX_CPU_SEC,
-	ROUND(
-		(
-			100.0 * B.APPROX_CPU_MS / NULLIF(T.WORKLOAD_APPROX_CPU_MS, 0)
-		)::NUMERIC,
-		2
-	) AS APPROX_CPU_PCT_OF_WORKLOAD,
-	ROUND((B.IO_TIME_MS / 1000.0)::NUMERIC, 2) AS IO_TIME_SEC,
-	ROUND(
-		(100.0 * B.IO_TIME_MS / NULLIF(B.TOTAL_EXEC_MS, 0))::NUMERIC,
-		2
-	) AS IO_TIME_PCT_INSIDE_QUERY,
-	ROUND(
-		(B.TOTAL_EXEC_MS / NULLIF(B.CALLS, 0))::NUMERIC,
-		2
-	) AS AVG_EXEC_MS_PER_CALL,
-	ROUND(B.MIN_EXEC_MS::NUMERIC, 2) AS MIN_EXEC_MS,
-	ROUND(B.MAX_EXEC_MS::NUMERIC, 2) AS MAX_EXEC_MS,
-	ROUND((B.TOTAL_ROWS::NUMERIC / NULLIF(B.CALLS, 0)), 2) AS AVG_ROWS_PER_CALL,
-	B.SHARED_BLKS_HIT,
-	B.SHARED_BLKS_READ,
-	B.SHARED_BLKS_DIRTIED,
-	B.SHARED_BLKS_WRITTEN,
-	B.TEMP_BLKS_READ,
-	B.TEMP_BLKS_WRITTEN,
-	LEFT(B.QUERY_TEXT, 3000) AS QUERY_TEXT
+    COALESCE(d.datname, b.db_id::text) AS database_name,
+    COALESCE(r.rolname, b.user_id::text) AS user_name,
+
+    b.query_id,
+    b.query_type,
+    b.plan_count,
+    b.plan_ids,
+
+    b.first_seen,
+    b.last_seen,
+
+    b.calls,
+
+    ROUND((b.total_exec_ms / 1000.0)::numeric, 2) AS total_exec_sec,
+
+    ROUND(
+        (
+            100.0 * b.total_exec_ms / NULLIF(t.workload_exec_ms, 0)
+        )::numeric,
+        2
+    ) AS exec_time_pct_of_workload,
+
+    ROUND(
+        (b.total_exec_ms / NULLIF(b.calls, 0))::numeric,
+        2
+    ) AS avg_exec_ms_per_call,
+
+    ROUND(b.min_exec_ms::numeric, 2) AS min_exec_ms,
+    ROUND(b.max_exec_ms::numeric, 2) AS max_exec_ms,
+
+    ROUND(
+        (b.total_rows::numeric / NULLIF(b.calls, 0)),
+        2
+    ) AS avg_rows_per_call,
+
+    b.total_rows,
+
+    b.shared_blks_hit,
+    b.shared_blks_read,
+    b.shared_blks_dirtied,
+    b.shared_blks_written,
+
+    b.temp_blks_read,
+    b.temp_blks_written,
+
+    ROUND((b.blk_read_time_ms / 1000.0)::numeric, 2) AS blk_read_time_sec,
+    ROUND((b.blk_write_time_ms / 1000.0)::numeric, 2) AS blk_write_time_sec,
+
+    LEFT(b.query_text, 3000) AS query_text
 FROM
-	BASE B
-	CROSS JOIN TOTALS T
-	LEFT JOIN PG_DATABASE D ON D.OID = B.DB_ID
-	LEFT JOIN PG_ROLES R ON R.OID = B.USER_ID
+    base b
+    CROSS JOIN totals t
+    LEFT JOIN pg_database d ON d.oid = b.db_id
+    LEFT JOIN pg_roles r ON r.oid = b.user_id
 ORDER BY
-	B.APPROX_CPU_MS DESC
+    b.total_exec_ms DESC
 LIMIT
-	50;
+    50;
+
