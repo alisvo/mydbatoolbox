@@ -5,6 +5,7 @@ Bu doküman, PostgreSQL veritabanlarında performans darboğazlarını bulmak, d
 ---
 
 ## 📊 1. Sistem Uptime ve İndeks Kullanım Röntgeni
+
 Sistem ne zamandır ayakta, istatistikler ne zamandır toplanıyor ve **hangi indeksler gerçekten kullanılıyor (hangileri yatıyor)?** Tek sorguda sistemin genel okuma röntgeni:
 
 ```sql
@@ -38,7 +39,10 @@ ORDER BY kullanim_sayisi DESC NULLS FIRST;
 ---
 
 ## 🗑️ 2. Ölü İndeks Avcısı (Kullanılmayan İndeksler)
-Yazma performansını düşüren ve sadece diskte yer kaplayan, `idx_scan` değeri 0 olan asalak indeksleri bulur. *(Not: PK ve Unique indeksler hariç tutulmuştur).*
+
+Yazma performansını düşüren ve sadece diskte yer kaplayan, `idx_scan` değeri 0 olan asalak indeksleri bulur.
+
+> Not: Primary Key ve Unique indeksler hariç tutulmuştur.
 
 ```sql
 SELECT 
@@ -56,23 +60,33 @@ ORDER BY pg_relation_size(i.indexrelid) DESC;
 ---
 
 ## 💾 3. Tablo ve İndeks Boyutları (Disk Kullanımı)
-Veritabanındaki en obez tablolar hangileri? Tablonun kendi ham boyutu ne, üzerindeki indekslerin toplam boyutu ne? En büyük yük getirenden küçüğe doğru listeler.
+
+Veritabanındaki en obez tablolar hangileri? Tablonun kendi ham boyutu ne, üzerindeki indekslerin toplam boyutu ne ve yaklaşık kaç kayıt var? En büyük yük getirenden küçüğe doğru listeler.
+
+> Not: `estimated_row_count` değeri `pg_stat_user_tables.n_live_tup` üzerinden gelir. Yani anlık `COUNT(*)` değildir; PostgreSQL istatistiklerine dayalı yaklaşık kayıt sayısıdır. Güncel olması için ilgili tablolarda `ANALYZE` çalışmış olmalıdır.
 
 ```sql
 SELECT
-    relname AS table_name,
-    pg_size_pretty(pg_total_relation_size(relid)) AS total_size_with_indexes,
-    pg_size_pretty(pg_relation_size(relid)) AS table_data_size,
-    pg_size_pretty(pg_indexes_size(relid)) AS total_index_size
-FROM pg_catalog.pg_statio_user_tables
-ORDER BY pg_total_relation_size(relid) DESC
+    t.schemaname || '.' || t.relname AS table_name,
+    s.n_live_tup AS estimated_row_count,
+    s.n_dead_tup AS estimated_dead_rows,
+    pg_size_pretty(pg_total_relation_size(t.relid)) AS total_size_with_indexes,
+    pg_size_pretty(pg_relation_size(t.relid)) AS table_data_size,
+    pg_size_pretty(pg_indexes_size(t.relid)) AS total_index_size,
+    s.last_analyze,
+    s.last_autoanalyze
+FROM pg_catalog.pg_statio_user_tables t
+JOIN pg_catalog.pg_stat_user_tables s
+  ON s.relid = t.relid
+ORDER BY pg_total_relation_size(t.relid) DESC
 LIMIT 50;
 ```
 
 ---
 
 ## 🧟 4. Vacuum ve Bloat (Ölü Satır) Sağlık Kontrolü
-Veritabanındaki tabloların "Ölü Satır" (Dead Tuple) oranlarını hesaplar. Bir tabloda oran %20'leri geçiyorsa, Autovacuum o tabloya yetişemiyor demektir ve acil müdahale gerekir.
+
+Veritabanındaki tabloların "Ölü Satır" (Dead Tuple) oranlarını hesaplar. Bir tabloda oran %20'leri geçiyorsa, Autovacuum o tabloya yetişemiyor olabilir ve müdahale gerekebilir.
 
 ```sql
 SELECT 
@@ -91,10 +105,12 @@ LIMIT 50;
 ---
 
 ## 🗺️ 5. Tablo İndeks Haritası
-Veritabanındaki tabloların üzerinde o an hangi indekslerin var olduğunu, oluşturulma script'leri (DDL) ile birlikte hızlıca döküm halinde görmek için kullanılır.
+
+Veritabanındaki tabloların üzerinde o an hangi indekslerin var olduğunu, oluşturulma script'leri yani DDL bilgileri ile birlikte hızlıca döküm halinde görmek için kullanılır.
 
 ```sql
 SELECT 
+    schemaname,
     tablename, 
     indexname, 
     indexdef
@@ -106,9 +122,17 @@ ORDER BY tablename, indexname;
 ---
 
 ## ⏱️ 6. CPU ve Zaman Canavarı Sorgular (Performance Insights)
-Veritabanında toplam çalışma süresi en yüksek olan, CPU'yu ve RAM'i en çok sömüren ilk 10 sorguyu getirir.
 
-### Standart PostgreSQL (`pg_stat_statements` aktif ise)
+Veritabanında toplam çalışma süresi en yüksek olan, CPU'yu ve RAM'i en çok sömüren sorguları getirir.
+
+---
+
+### 6.1 Standart PostgreSQL (`pg_stat_statements` aktif ise)
+
+`pg_stat_statements`, tarih-saat bazlı geçmiş tutmaz. Bu sorgu, istatistiklerin son sıfırlanma zamanından itibaren biriken veriyi gösterir.
+
+> Zaman aralığı ile analiz yapmak istiyorsan, test öncesinde `pg_stat_statements_reset()` ile istatistikler sıfırlanabilir veya dışarıda metrik toplama sistemi kullanılmalıdır.
+
 ```sql
 SELECT 
     query, 
@@ -123,16 +147,80 @@ ORDER BY total_exec_time DESC
 LIMIT 10;
 ```
 
-### Azure PostgreSQL Flexible Server (`azure_sys` DB'sinde çalıştırılmalıdır)
+İstatistiklerin hangi zamandan beri biriktiğini görmek için:
+
 ```sql
+SELECT
+    d.datname,
+    d.stats_reset AS database_stats_reset,
+    pss.stats_reset AS pg_stat_statements_stats_reset
+FROM pg_stat_database d
+CROSS JOIN pg_stat_statements_info pss
+WHERE d.datname = current_database();
+```
+
+---
+
+### 6.2 Azure PostgreSQL Flexible Server (`azure_sys` DB'sinde çalıştırılmalıdır)
+
+Azure PostgreSQL Flexible Server tarafında Query Store verisi üzerinden bakılır. Bu sorguda tarih-saat aralığı opsiyoneldir.
+
+`from_ts` ve `to_ts` değerleri `NULL` bırakılırsa Query Store'daki mevcut tüm veri üzerinden çalışır. Belirli bir aralık için bu iki alan doldurulmalıdır.
+
+```sql
+WITH params AS (
+    SELECT
+        NULL::timestamp AS from_ts,
+        NULL::timestamp AS to_ts
+
+        -- Örnek tarih aralığı:
+        -- '2026-07-01 20:00:00'::timestamp AS from_ts,
+        -- '2026-07-02 02:00:00'::timestamp AS to_ts
+)
 SELECT 
-    query_id,
-    SUM(calls) AS toplam_calisma_sayisi,
-    ROUND(SUM(total_time)::numeric, 2) AS toplam_harcanan_sure_ms,
-    ROUND(AVG(mean_time)::numeric, 2) AS ortalama_sure_ms,
-    ROUND(MAX(max_time)::numeric, 2) AS en_yuksek_sure_ms
-FROM query_store.qs_view
-GROUP BY query_id
+    q.query_id,
+    SUM(q.calls) AS toplam_calisma_sayisi,
+    ROUND(SUM(q.total_time)::numeric, 2) AS toplam_harcanan_sure_ms,
+    ROUND((SUM(q.total_time) / NULLIF(SUM(q.calls), 0))::numeric, 2) AS agirlikli_ortalama_sure_ms,
+    ROUND(MAX(q.max_time)::numeric, 2) AS en_yuksek_sure_ms,
+    MIN(q.start_time) AS ilk_gorulen_zaman,
+    MAX(q.end_time) AS son_gorulen_zaman
+FROM query_store.qs_view q
+CROSS JOIN params p
+WHERE (p.from_ts IS NULL OR q.end_time >= p.from_ts)
+  AND (p.to_ts IS NULL OR q.start_time < p.to_ts)
+GROUP BY q.query_id
 ORDER BY toplam_harcanan_sure_ms DESC
 LIMIT 10;
 ```
+
+---
+
+### 6.3 Azure PostgreSQL Flexible Server - Tarih Aralıklı Örnek
+
+Örneğin sadece `2026-07-01 20:00` ile `2026-07-02 02:00` arasındaki en pahalı sorguları görmek için:
+
+```sql
+WITH params AS (
+    SELECT
+        '2026-07-01 20:00:00'::timestamp AS from_ts,
+        '2026-07-02 02:00:00'::timestamp AS to_ts
+)
+SELECT 
+    q.query_id,
+    SUM(q.calls) AS toplam_calisma_sayisi,
+    ROUND(SUM(q.total_time)::numeric, 2) AS toplam_harcanan_sure_ms,
+    ROUND((SUM(q.total_time) / NULLIF(SUM(q.calls), 0))::numeric, 2) AS agirlikli_ortalama_sure_ms,
+    ROUND(MAX(q.max_time)::numeric, 2) AS en_yuksek_sure_ms,
+    MIN(q.start_time) AS ilk_gorulen_zaman,
+    MAX(q.end_time) AS son_gorulen_zaman
+FROM query_store.qs_view q
+CROSS JOIN params p
+WHERE q.end_time >= p.from_ts
+  AND q.start_time < p.to_ts
+GROUP BY q.query_id
+ORDER BY toplam_harcanan_sure_ms DESC
+LIMIT 10;
+```
+
+> Not: `AVG(mean_time)` yerine `SUM(total_time) / SUM(calls)` kullanılmıştır. Bu daha sağlıklıdır, çünkü Query Store içindeki her satır/bucket aynı sayıda execution içermeyebilir.
