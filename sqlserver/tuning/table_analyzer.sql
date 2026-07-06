@@ -14,7 +14,9 @@
     10. Default constraints
     11. Triggers
     12. Statistics
-    13. Index usage since last SQL Server service restart / DB attach
+    13. Rowstore fragmentation / physical stats for heap, clustered index, and nonclustered indexes
+    14. Columnstore row group health, if any
+    15. Index usage since last SQL Server service restart / DB attach
 
    USAGE:
      Set @DatabaseName, @SchemaName, @TableName below, then execute whole script.
@@ -29,9 +31,19 @@
 
 SET NOCOUNT ON;
 
-DECLARE @DatabaseName SYSNAME = N'EFTEST';
+DECLARE @DatabaseName SYSNAME = N'EFF_TEST';
 DECLARE @SchemaName   SYSNAME = N'dbo';
-DECLARE @TableName    SYSNAME = N'SUMMARY';
+DECLARE @TableName    SYSNAME = N'BPF_SECTORS';
+
+-- Fragmentation scan mode:
+--   LIMITED  = safest/fastest daily check; default recommended.
+--   SAMPLED  = more accurate for large indexes, heavier.
+--   DETAILED = most accurate, heaviest; avoid on large busy tables unless needed.
+DECLARE @FragmentationMode NVARCHAR(20) = N'LIMITED';
+
+-- Maintenance hint ignores fragmentation percentages below this page count.
+-- 1000 pages ~= 8 MB. Adjust if your environment uses a different threshold.
+DECLARE @MinPageCountForFragmentation INT = 1000;
 
 IF DB_ID(@DatabaseName) IS NULL
 BEGIN
@@ -45,8 +57,20 @@ SET NOCOUNT ON;
 
 DECLARE @SchemaName SYSNAME = @pSchemaName;
 DECLARE @TableName  SYSNAME = @pTableName;
+DECLARE @FragmentationMode NVARCHAR(20) = UPPER(@pFragmentationMode);
+DECLARE @MinPageCountForFragmentation INT = @pMinPageCountForFragmentation;
 DECLARE @FullName   NVARCHAR(517) = QUOTENAME(@SchemaName) + N''.'' + QUOTENAME(@TableName);
 DECLARE @ObjectId   INT = OBJECT_ID(@FullName, N''U'');
+
+IF @FragmentationMode NOT IN (N''LIMITED'', N''SAMPLED'', N''DETAILED'')
+BEGIN
+    THROW 51002, N''Invalid @FragmentationMode. Use LIMITED, SAMPLED, or DETAILED.'', 1;
+END;
+
+IF @MinPageCountForFragmentation IS NULL OR @MinPageCountForFragmentation < 0
+BEGIN
+    SET @MinPageCountForFragmentation = 0;
+END;
 
 IF @ObjectId IS NULL
 BEGIN
@@ -461,9 +485,87 @@ WHERE st.object_id = @ObjectId
 ORDER BY st.stats_id;
 
 ------------------------------------------------------------------------------
--- 13. INDEX USAGE SINCE LAST RESTART / DB ATTACH
+-- 13. ROWSTORE FRAGMENTATION / PHYSICAL STATS
 ------------------------------------------------------------------------------
-PRINT ''=== 13. INDEX USAGE SINCE LAST RESTART / DB ATTACH ==='';
+PRINT ''=== 13. ROWSTORE FRAGMENTATION / PHYSICAL STATS ==='';
+
+SELECT
+    ips.index_id,
+    COALESCE(i.name, CASE WHEN ips.index_id = 0 THEN N''[HEAP]'' ELSE N''[UNNAMED]'' END) AS IndexName,
+    i.type_desc AS IndexType,
+    ips.partition_number,
+    p.data_compression_desc AS DataCompression,
+    ips.alloc_unit_type_desc AS AllocationUnitType,
+    ips.index_depth,
+    ips.avg_fragmentation_in_percent,
+    ips.fragment_count,
+    ips.avg_fragment_size_in_pages,
+    ips.page_count,
+    CONVERT(DECIMAL(19, 2), ips.page_count * 8.0 / 1024) AS SizeMB,
+    ips.avg_page_space_used_in_percent,
+    ips.record_count,
+    ips.ghost_record_count,
+    ips.forwarded_record_count,
+    CONVERT(DECIMAL(9, 2), 100.0 * ips.forwarded_record_count / NULLIF(ips.record_count, 0)) AS ForwardedRecordPercent,
+    CASE
+        WHEN ips.page_count < @MinPageCountForFragmentation THEN N''IGNORE_SMALL_INDEX''
+        WHEN i.type IN (5, 6) THEN N''COLUMNSTORE_SEE_SECTION_14''
+        WHEN ips.index_id = 0 AND ips.avg_fragmentation_in_percent >= 30 THEN N''HEAP_CONSIDER_REBUILD_OR_CLUSTERED_INDEX''
+        WHEN ips.avg_fragmentation_in_percent < 5 THEN N''OK''
+        WHEN ips.avg_fragmentation_in_percent < 30 THEN N''CONSIDER_REORGANIZE''
+        ELSE N''CONSIDER_REBUILD''
+    END AS MaintenanceHint,
+    @FragmentationMode AS ScanMode,
+    @MinPageCountForFragmentation AS HintMinPageCount
+FROM sys.dm_db_index_physical_stats(DB_ID(), @ObjectId, NULL, NULL, @FragmentationMode) AS ips
+LEFT JOIN sys.indexes AS i
+    ON i.object_id = ips.object_id
+   AND i.index_id = ips.index_id
+LEFT JOIN sys.partitions AS p
+    ON p.object_id = ips.object_id
+   AND p.index_id = ips.index_id
+   AND p.partition_number = ips.partition_number
+WHERE ips.index_level = 0
+ORDER BY
+    CASE WHEN ips.index_id IN (0, 1) THEN 0 ELSE 1 END,
+    ips.page_count DESC,
+    ips.avg_fragmentation_in_percent DESC;
+
+------------------------------------------------------------------------------
+-- 14. COLUMNSTORE ROW GROUP HEALTH, IF ANY
+------------------------------------------------------------------------------
+PRINT ''=== 14. COLUMNSTORE ROW GROUP HEALTH, IF ANY ==='';
+
+SELECT
+    rg.index_id,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    rg.partition_number,
+    rg.row_group_id,
+    rg.state_desc,
+    rg.total_rows,
+    rg.deleted_rows,
+    CONVERT(DECIMAL(9, 2), 100.0 * rg.deleted_rows / NULLIF(rg.total_rows, 0)) AS DeletedRowsPercent,
+    rg.size_in_bytes / 1024.0 / 1024.0 AS SizeMB,
+    CASE
+        WHEN rg.total_rows = 0 THEN N''EMPTY_ROWGROUP''
+        WHEN 100.0 * rg.deleted_rows / NULLIF(rg.total_rows, 0) >= 20 THEN N''CONSIDER_COLUMNSTORE_MAINTENANCE''
+        ELSE N''OK''
+    END AS MaintenanceHint
+FROM sys.dm_db_column_store_row_group_physical_stats AS rg
+JOIN sys.indexes AS i
+    ON i.object_id = rg.object_id
+   AND i.index_id = rg.index_id
+WHERE rg.object_id = @ObjectId
+ORDER BY
+    rg.index_id,
+    rg.partition_number,
+    rg.row_group_id;
+
+------------------------------------------------------------------------------
+-- 15. INDEX USAGE SINCE LAST RESTART / DB ATTACH
+------------------------------------------------------------------------------
+PRINT ''=== 15. INDEX USAGE SINCE LAST RESTART / DB ATTACH ==='';
 
 SELECT
     i.index_id,
@@ -488,6 +590,8 @@ ORDER BY i.index_id;
 
 EXEC sys.sp_executesql
     @Sql,
-    N'@pSchemaName SYSNAME, @pTableName SYSNAME',
+    N'@pSchemaName SYSNAME, @pTableName SYSNAME, @pFragmentationMode NVARCHAR(20), @pMinPageCountForFragmentation INT',
     @pSchemaName = @SchemaName,
-    @pTableName  = @TableName;
+    @pTableName  = @TableName,
+    @pFragmentationMode = @FragmentationMode,
+    @pMinPageCountForFragmentation = @MinPageCountForFragmentation;
