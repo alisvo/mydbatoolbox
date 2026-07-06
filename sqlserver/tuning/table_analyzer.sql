@@ -14,8 +14,8 @@
     10. Default constraints
     11. Triggers
     12. Statistics
-    13. Rowstore fragmentation / physical stats for heap, clustered index, and nonclustered indexes
-    14. Columnstore row group health, if any
+    13. Rowstore fragmentation / physical stats + generated maintenance commands
+    14. Columnstore row group health + generated maintenance commands, if any
     15. Index usage since last SQL Server service restart / DB attach
 
    USAGE:
@@ -33,7 +33,7 @@ SET NOCOUNT ON;
 
 DECLARE @DatabaseName SYSNAME = N'EFF_TEST';
 DECLARE @SchemaName   SYSNAME = N'dbo';
-DECLARE @TableName    SYSNAME = N'BPF_SECTORS';
+DECLARE @TableName    SYSNAME = N'EFFArchive';
 
 -- Fragmentation scan mode:
 --   LIMITED  = safest/fastest daily check; default recommended.
@@ -44,6 +44,24 @@ DECLARE @FragmentationMode NVARCHAR(20) = N'LIMITED';
 -- Maintenance hint ignores fragmentation percentages below this page count.
 -- 1000 pages ~= 8 MB. Adjust if your environment uses a different threshold.
 DECLARE @MinPageCountForFragmentation INT = 1000;
+
+-- Default practical thresholds commonly used for index maintenance.
+-- 5 <= fragmentation < 30  => REORGANIZE
+-- fragmentation >= 30      => REBUILD
+DECLARE @ReorganizeFragmentationPercent DECIMAL(5,2) = 5.00;
+DECLARE @RebuildFragmentationPercent     DECIMAL(5,2) = 30.00;
+
+-- Generated commands only. They are NOT executed by this script.
+-- User preference: default generated REBUILD commands include ONLINE = ON.
+DECLARE @UseOnlineRebuild BIT = 1;
+DECLARE @UseSortInTempdb  BIT = 1;
+DECLARE @UseLobCompactionForReorganize BIT = 1;
+
+-- For partitioned indexes, generate partition-level commands instead of whole-index commands.
+DECLARE @GeneratePartitionLevelCommands BIT = 1;
+
+-- Columnstore helper threshold for section 14.
+DECLARE @ColumnstoreDeletedRowsPercentThreshold DECIMAL(5,2) = 20.00;
 
 IF DB_ID(@DatabaseName) IS NULL
 BEGIN
@@ -59,6 +77,13 @@ DECLARE @SchemaName SYSNAME = @pSchemaName;
 DECLARE @TableName  SYSNAME = @pTableName;
 DECLARE @FragmentationMode NVARCHAR(20) = UPPER(@pFragmentationMode);
 DECLARE @MinPageCountForFragmentation INT = @pMinPageCountForFragmentation;
+DECLARE @ReorganizeFragmentationPercent DECIMAL(5,2) = @pReorganizeFragmentationPercent;
+DECLARE @RebuildFragmentationPercent DECIMAL(5,2) = @pRebuildFragmentationPercent;
+DECLARE @UseOnlineRebuild BIT = @pUseOnlineRebuild;
+DECLARE @UseSortInTempdb BIT = @pUseSortInTempdb;
+DECLARE @UseLobCompactionForReorganize BIT = @pUseLobCompactionForReorganize;
+DECLARE @GeneratePartitionLevelCommands BIT = @pGeneratePartitionLevelCommands;
+DECLARE @ColumnstoreDeletedRowsPercentThreshold DECIMAL(5,2) = @pColumnstoreDeletedRowsPercentThreshold;
 DECLARE @FullName   NVARCHAR(517) = QUOTENAME(@SchemaName) + N''.'' + QUOTENAME(@TableName);
 DECLARE @ObjectId   INT = OBJECT_ID(@FullName, N''U'');
 
@@ -70,6 +95,18 @@ END;
 IF @MinPageCountForFragmentation IS NULL OR @MinPageCountForFragmentation < 0
 BEGIN
     SET @MinPageCountForFragmentation = 0;
+END;
+
+IF @ReorganizeFragmentationPercent IS NULL OR @RebuildFragmentationPercent IS NULL
+   OR @ReorganizeFragmentationPercent < 0
+   OR @RebuildFragmentationPercent <= @ReorganizeFragmentationPercent
+BEGIN
+    THROW 51003, N''Invalid fragmentation thresholds. Rebuild threshold must be greater than reorganize threshold.'', 1;
+END;
+
+IF @ColumnstoreDeletedRowsPercentThreshold IS NULL OR @ColumnstoreDeletedRowsPercentThreshold < 0
+BEGIN
+    SET @ColumnstoreDeletedRowsPercentThreshold = 20.00;
 END;
 
 IF @ObjectId IS NULL
@@ -485,56 +522,127 @@ WHERE st.object_id = @ObjectId
 ORDER BY st.stats_id;
 
 ------------------------------------------------------------------------------
--- 13. ROWSTORE FRAGMENTATION / PHYSICAL STATS
+-- 13. ROWSTORE FRAGMENTATION / PHYSICAL STATS + GENERATED MAINTENANCE COMMANDS
 ------------------------------------------------------------------------------
-PRINT ''=== 13. ROWSTORE FRAGMENTATION / PHYSICAL STATS ==='';
+PRINT ''=== 13. ROWSTORE FRAGMENTATION / PHYSICAL STATS + GENERATED MAINTENANCE COMMANDS ==='';
 
+;WITH phys AS
+(
+    SELECT
+        ips.object_id,
+        ips.index_id,
+        ips.partition_number,
+        ips.alloc_unit_type_desc,
+        ips.index_level,
+        ips.index_depth,
+        ips.avg_fragmentation_in_percent,
+        ips.fragment_count,
+        ips.avg_fragment_size_in_pages,
+        ips.page_count,
+        ips.avg_page_space_used_in_percent,
+        ips.record_count,
+        ips.ghost_record_count,
+        ips.forwarded_record_count,
+        i.name AS IndexNameRaw,
+        i.type AS IndexTypeId,
+        i.type_desc AS IndexType,
+        p.data_compression_desc AS DataCompression,
+        pi.PartitionCount,
+        CONVERT(DECIMAL(9, 2), 100.0 * ips.forwarded_record_count / NULLIF(ips.record_count, 0)) AS ForwardedRecordPercent
+    FROM sys.dm_db_index_physical_stats(DB_ID(), @ObjectId, NULL, NULL, @FragmentationMode) AS ips
+    LEFT JOIN sys.indexes AS i
+        ON i.object_id = ips.object_id
+       AND i.index_id = ips.index_id
+    LEFT JOIN sys.partitions AS p
+        ON p.object_id = ips.object_id
+       AND p.index_id = ips.index_id
+       AND p.partition_number = ips.partition_number
+    OUTER APPLY
+    (
+        SELECT COUNT(*) AS PartitionCount
+        FROM sys.partitions AS p2
+        WHERE p2.object_id = ips.object_id
+          AND p2.index_id = ips.index_id
+    ) AS pi
+    WHERE ips.index_level = 0
+)
 SELECT
-    ips.index_id,
-    COALESCE(i.name, CASE WHEN ips.index_id = 0 THEN N''[HEAP]'' ELSE N''[UNNAMED]'' END) AS IndexName,
-    i.type_desc AS IndexType,
-    ips.partition_number,
-    p.data_compression_desc AS DataCompression,
-    ips.alloc_unit_type_desc AS AllocationUnitType,
-    ips.index_depth,
-    ips.avg_fragmentation_in_percent,
-    ips.fragment_count,
-    ips.avg_fragment_size_in_pages,
-    ips.page_count,
-    CONVERT(DECIMAL(19, 2), ips.page_count * 8.0 / 1024) AS SizeMB,
-    ips.avg_page_space_used_in_percent,
-    ips.record_count,
-    ips.ghost_record_count,
-    ips.forwarded_record_count,
-    CONVERT(DECIMAL(9, 2), 100.0 * ips.forwarded_record_count / NULLIF(ips.record_count, 0)) AS ForwardedRecordPercent,
+    ph.index_id,
+    COALESCE(ph.IndexNameRaw, CASE WHEN ph.index_id = 0 THEN N''[HEAP]'' ELSE N''[UNNAMED]'' END) AS IndexName,
+    ph.IndexType,
+    ph.partition_number,
+    ph.PartitionCount,
+    ph.DataCompression,
+    ph.alloc_unit_type_desc AS AllocationUnitType,
+    ph.index_depth,
+    ph.avg_fragmentation_in_percent,
+    ph.fragment_count,
+    ph.avg_fragment_size_in_pages,
+    ph.page_count,
+    CONVERT(DECIMAL(19, 2), ph.page_count * 8.0 / 1024) AS SizeMB,
+    ph.avg_page_space_used_in_percent,
+    ph.record_count,
+    ph.ghost_record_count,
+    ph.forwarded_record_count,
+    ph.ForwardedRecordPercent,
     CASE
-        WHEN ips.page_count < @MinPageCountForFragmentation THEN N''IGNORE_SMALL_INDEX''
-        WHEN i.type IN (5, 6) THEN N''COLUMNSTORE_SEE_SECTION_14''
-        WHEN ips.index_id = 0 AND ips.avg_fragmentation_in_percent >= 30 THEN N''HEAP_CONSIDER_REBUILD_OR_CLUSTERED_INDEX''
-        WHEN ips.avg_fragmentation_in_percent < 5 THEN N''OK''
-        WHEN ips.avg_fragmentation_in_percent < 30 THEN N''CONSIDER_REORGANIZE''
+        WHEN ph.page_count < @MinPageCountForFragmentation THEN N''IGNORE_SMALL_INDEX''
+        WHEN ph.IndexTypeId IN (5, 6) THEN N''COLUMNSTORE_SEE_SECTION_14''
+        WHEN ph.index_id = 0 AND COALESCE(ph.ForwardedRecordPercent, 0) >= 10 THEN N''HEAP_CONSIDER_REBUILD_OR_CLUSTERED_INDEX''
+        WHEN ph.index_id = 0 AND ph.avg_fragmentation_in_percent >= @RebuildFragmentationPercent THEN N''HEAP_CONSIDER_REBUILD_OR_CLUSTERED_INDEX''
+        WHEN ph.avg_fragmentation_in_percent < @ReorganizeFragmentationPercent THEN N''OK''
+        WHEN ph.avg_fragmentation_in_percent < @RebuildFragmentationPercent THEN N''CONSIDER_REORGANIZE''
         ELSE N''CONSIDER_REBUILD''
     END AS MaintenanceHint,
+    CASE
+        WHEN ph.page_count < @MinPageCountForFragmentation THEN NULL
+        WHEN ph.IndexTypeId IN (5, 6) THEN NULL
+        WHEN ph.index_id = 0
+             AND (COALESCE(ph.ForwardedRecordPercent, 0) >= 10 OR ph.avg_fragmentation_in_percent >= @RebuildFragmentationPercent)
+            THEN N''ALTER TABLE '' + @FullName + N'' REBUILD;''
+        WHEN ph.IndexNameRaw IS NULL THEN NULL
+        WHEN ph.avg_fragmentation_in_percent >= @RebuildFragmentationPercent
+            THEN N''ALTER INDEX '' + QUOTENAME(ph.IndexNameRaw) + N'' ON '' + @FullName
+               + N'' REBUILD''
+               + CASE WHEN @GeneratePartitionLevelCommands = 1 AND ph.PartitionCount > 1
+                      THEN N'' PARTITION = '' + CONVERT(NVARCHAR(20), ph.partition_number)
+                      ELSE N'''' END
+               + N'' WITH (''
+               + CASE WHEN @UseOnlineRebuild = 1 THEN N''ONLINE = ON'' ELSE N''ONLINE = OFF'' END
+               + CASE WHEN @UseSortInTempdb = 1 THEN N'', SORT_IN_TEMPDB = ON'' ELSE N'''' END
+               + N'');''
+        WHEN ph.avg_fragmentation_in_percent >= @ReorganizeFragmentationPercent
+            THEN N''ALTER INDEX '' + QUOTENAME(ph.IndexNameRaw) + N'' ON '' + @FullName
+               + N'' REORGANIZE''
+               + CASE WHEN @GeneratePartitionLevelCommands = 1 AND ph.PartitionCount > 1
+                      THEN N'' PARTITION = '' + CONVERT(NVARCHAR(20), ph.partition_number)
+                      ELSE N'''' END
+               + CASE WHEN @UseLobCompactionForReorganize = 1 THEN N'' WITH (LOB_COMPACTION = ON)'' ELSE N'''' END
+               + N'';''
+        ELSE NULL
+    END AS RecommendedCommand,
+    CASE
+        WHEN ph.page_count < @MinPageCountForFragmentation THEN N''No command generated: below minimum page-count threshold.''
+        WHEN ph.IndexTypeId IN (5, 6) THEN N''Columnstore command is handled in section 14.''
+        WHEN ph.index_id = 0 THEN N''Heap command generated without ONLINE option; consider whether a clustered index is a better long-term fix for forwarded records.''
+        WHEN ph.avg_fragmentation_in_percent >= @RebuildFragmentationPercent THEN N''Generated REBUILD command uses ONLINE = ON by default. It can still briefly block at start/end and can fail for unsupported index/edition/type; remove ONLINE = ON if needed.''
+        WHEN ph.avg_fragmentation_in_percent >= @ReorganizeFragmentationPercent THEN N''Generated REORGANIZE command is online by nature and single-threaded; no ONLINE = ON option exists for REORGANIZE.''
+        ELSE N''No command generated: fragmentation below reorganize threshold.''
+    END AS CommandNote,
     @FragmentationMode AS ScanMode,
-    @MinPageCountForFragmentation AS HintMinPageCount
-FROM sys.dm_db_index_physical_stats(DB_ID(), @ObjectId, NULL, NULL, @FragmentationMode) AS ips
-LEFT JOIN sys.indexes AS i
-    ON i.object_id = ips.object_id
-   AND i.index_id = ips.index_id
-LEFT JOIN sys.partitions AS p
-    ON p.object_id = ips.object_id
-   AND p.index_id = ips.index_id
-   AND p.partition_number = ips.partition_number
-WHERE ips.index_level = 0
+    @MinPageCountForFragmentation AS HintMinPageCount,
+    @ReorganizeFragmentationPercent AS ReorganizeThresholdPercent,
+    @RebuildFragmentationPercent AS RebuildThresholdPercent
+FROM phys AS ph
 ORDER BY
-    CASE WHEN ips.index_id IN (0, 1) THEN 0 ELSE 1 END,
-    ips.page_count DESC,
-    ips.avg_fragmentation_in_percent DESC;
+    CASE WHEN ph.index_id IN (0, 1) THEN 0 ELSE 1 END,
+    ph.page_count DESC,
+    ph.avg_fragmentation_in_percent DESC;
 
 ------------------------------------------------------------------------------
--- 14. COLUMNSTORE ROW GROUP HEALTH, IF ANY
+-- 14. COLUMNSTORE ROW GROUP HEALTH + GENERATED MAINTENANCE COMMANDS, IF ANY
 ------------------------------------------------------------------------------
-PRINT ''=== 14. COLUMNSTORE ROW GROUP HEALTH, IF ANY ==='';
+PRINT ''=== 14. COLUMNSTORE ROW GROUP HEALTH + GENERATED MAINTENANCE COMMANDS, IF ANY ==='';
 
 SELECT
     rg.index_id,
@@ -549,9 +657,21 @@ SELECT
     rg.size_in_bytes / 1024.0 / 1024.0 AS SizeMB,
     CASE
         WHEN rg.total_rows = 0 THEN N''EMPTY_ROWGROUP''
-        WHEN 100.0 * rg.deleted_rows / NULLIF(rg.total_rows, 0) >= 20 THEN N''CONSIDER_COLUMNSTORE_MAINTENANCE''
+        WHEN 100.0 * rg.deleted_rows / NULLIF(rg.total_rows, 0) >= @ColumnstoreDeletedRowsPercentThreshold THEN N''CONSIDER_COLUMNSTORE_REORGANIZE''
         ELSE N''OK''
-    END AS MaintenanceHint
+    END AS MaintenanceHint,
+    CASE
+        WHEN rg.total_rows > 0
+         AND 100.0 * rg.deleted_rows / NULLIF(rg.total_rows, 0) >= @ColumnstoreDeletedRowsPercentThreshold
+            THEN N''ALTER INDEX '' + QUOTENAME(i.name) + N'' ON '' + @FullName + N'' REORGANIZE;''
+        ELSE NULL
+    END AS RecommendedCommand,
+    CASE
+        WHEN rg.total_rows = 0 THEN N''No command generated: empty rowgroup.''
+        WHEN 100.0 * rg.deleted_rows / NULLIF(rg.total_rows, 0) >= @ColumnstoreDeletedRowsPercentThreshold THEN N''Columnstore REORGANIZE can help clean up deleted rows / rowgroups. Review before running on very large tables.''
+        ELSE N''No command generated: deleted row percentage below threshold.''
+    END AS CommandNote,
+    @ColumnstoreDeletedRowsPercentThreshold AS DeletedRowsThresholdPercent
 FROM sys.dm_db_column_store_row_group_physical_stats AS rg
 JOIN sys.indexes AS i
     ON i.object_id = rg.object_id
@@ -590,8 +710,28 @@ ORDER BY i.index_id;
 
 EXEC sys.sp_executesql
     @Sql,
-    N'@pSchemaName SYSNAME, @pTableName SYSNAME, @pFragmentationMode NVARCHAR(20), @pMinPageCountForFragmentation INT',
+    N'@pSchemaName SYSNAME,
+      @pTableName SYSNAME,
+      @pFragmentationMode NVARCHAR(20),
+      @pMinPageCountForFragmentation INT,
+      @pReorganizeFragmentationPercent DECIMAL(5,2),
+      @pRebuildFragmentationPercent DECIMAL(5,2),
+      @pUseOnlineRebuild BIT,
+      @pUseSortInTempdb BIT,
+      @pUseLobCompactionForReorganize BIT,
+      @pGeneratePartitionLevelCommands BIT,
+      @pColumnstoreDeletedRowsPercentThreshold DECIMAL(5,2)',
     @pSchemaName = @SchemaName,
     @pTableName  = @TableName,
     @pFragmentationMode = @FragmentationMode,
-    @pMinPageCountForFragmentation = @MinPageCountForFragmentation;
+    @pMinPageCountForFragmentation = @MinPageCountForFragmentation,
+    @pReorganizeFragmentationPercent = @ReorganizeFragmentationPercent,
+    @pRebuildFragmentationPercent = @RebuildFragmentationPercent,
+    @pUseOnlineRebuild = @UseOnlineRebuild,
+    @pUseSortInTempdb = @UseSortInTempdb,
+    @pUseLobCompactionForReorganize = @UseLobCompactionForReorganize,
+    @pGeneratePartitionLevelCommands = @GeneratePartitionLevelCommands,
+    @pColumnstoreDeletedRowsPercentThreshold = @ColumnstoreDeletedRowsPercentThreshold;
+
+
+
