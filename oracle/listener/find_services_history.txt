@@ -1,0 +1,17 @@
+Notes:
+- Example looking history, starting from 1800 seconds (30 minutes)
+- Service name can be changed
+
+
+Example:
+
+awk -v cutoff=$(( $(date +%s) - 1800 )) '
+BEGIN{
+  split("JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC",m," ");
+  for(i=1;i<=12;i++) mon[m[i]]=i;
+}
+/SERVICE_NAME=MYLISTENER\)/ {
+  split($1,d,"-"); split($2,t,":");
+  ts = mktime(d[3]" "mon[toupper(d[2])]" "d[1]" "t[1]" "t[2]" "t[3]);
+  if (ts >= cutoff) print;
+}' listener.log
