@@ -111,3 +111,29 @@ ORDER BY
 ### How to interpret the results:
 * **`RFS` (Remote File Server):** Should show as `RECEIVING` or `IDLE`.
 * **`MRP0` (Managed Recovery Process):** Should show as `APPLYING_LOG` or `WAIT_FOR_LOG`. If MRP is missing entirely, the apply process has crashed or been stopped.
+
+---
+
+## 4. Applied/Sent/General Controls
+
+
+
+```sql
+SELECT t.thread#,
+       t.sequence#                      AS current_seq,      -- being written now
+       s.last_sent,
+       s.last_applied,
+       t.sequence# - NVL(s.last_applied,0) AS logs_behind,
+       TO_CHAR(s.last_apply_time,'dd/mm/yyyy hh24:mi:ss') AS son_uygulama_zamani
+  FROM v$thread t
+  LEFT JOIN (SELECT thread#,
+                    MAX(sequence#) last_sent,
+                    MAX(CASE WHEN applied IN ('YES','IN-MEMORY') THEN sequence# END) last_applied,
+                    MAX(CASE WHEN applied IN ('YES','IN-MEMORY') THEN next_time END) last_apply_time
+               FROM v$archived_log
+              WHERE standby_dest = 'YES'
+                AND resetlogs_id = (SELECT resetlogs_id FROM v$database_incarnation WHERE status='CURRENT')
+              GROUP BY thread#) s
+    ON s.thread# = t.thread#
+ WHERE t.status = 'OPEN';
+```
