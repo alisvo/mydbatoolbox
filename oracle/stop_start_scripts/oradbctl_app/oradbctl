@@ -1,0 +1,640 @@
+#!/usr/bin/env bash
+#===============================================================================
+# oradbctl - Oracle Database start/stop controller
+#
+#   Version : 1.1.2
+#   Targets : RHEL 8/9+, Oracle Linux 8/9+
+#   Scope   : Oracle 19c+ (EE/SE2), single instance, non-RAC, non-ASM
+#             Standalone + Data Guard WITHOUT broker
+#             Consolidated hosts (many DBs / many ORACLE_HOMEs per server)
+#   Drives  : /etc/oratab entries flagged "Y" only
+#   Callers : crontab, Ansible (command/shell), systemd, interactive
+#
+#   Data Guard behaviour (no broker, role detected at runtime):
+#     PRIMARY          -> ALTER DATABASE OPEN
+#     PHYSICAL STANDBY -> OPEN READ ONLY  + MRP (USING CURRENT LOGFILE)   <- ADG
+#     LOGICAL STANDBY  -> OPEN + START LOGICAL STANDBY APPLY IMMEDIATE
+#     SNAPSHOT STANDBY -> OPEN
+#   Set ORADBCTL_STANDBY_OPEN=MOUNT to keep physical standbys mounted instead.
+#
+#   Listener: started BEFORE the databases, stopped AFTER them.
+#
+# USAGE
+#   oradbctl start|stop|restart|status [options]
+#
+# OPTIONS
+#   -d, --db SID[,SID...]     act only on these SIDs
+#   -x, --exclude SID[,...]   skip these SIDs
+#   -P, --parallel N          databases handled concurrently (default 1)
+#   -t, --timeout SEC         override start/stop timeout
+#       --with-listener       manage listeners      (default: on)
+#       --no-listener         do not touch listeners
+#       --abort               SHUTDOWN ABORT if IMMEDIATE times out (default)
+#       --no-abort            never abort; report failure instead
+#       --standby-open MODE   read_only | mount  (default: read_only)
+#   -j, --json                machine-readable summary on stdout (for Ansible)
+#   -q, --quiet               no human output (log file still written)
+#   -h, --help                this help
+#   -V, --version
+#
+# EXIT CODES
+#   0  everything OK (nothing to do counts as OK)
+#   1  at least one database/listener operation failed
+#   2  usage / configuration error
+#
+# LOGGING
+#   One file per day: $LOG_DIR/oradbctl-YYYYMMDD.log
+#   Self-cleaning: files older than ORADBCTL_LOG_KEEP_DAYS (default 30) are
+#   deleted at the start of every run. Set it to 0 to disable and use logrotate.
+#
+# CONFIG FILE (optional): /etc/sysconfig/oradbctl   -- plain shell, e.g.
+#   ORADBCTL_PARALLEL=4
+#   ORADBCTL_STANDBY_OPEN=MOUNT
+#   ORADBCTL_LOG_DIR=/u01/app/oracle/admin/scripts/log
+#   ORADBCTL_LOG_KEEP_DAYS=90
+#
+# May be started as root (re-execs itself as the Oracle software owner) or
+# directly as the oracle user.
+#===============================================================================
+
+set -uo pipefail
+umask 022
+
+VERSION="1.1.2"
+PROG="${0##*/}"
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+HOSTNAME_S="$(hostname -s 2>/dev/null || hostname)"
+
+#--- defaults (env > config file > built-in) -----------------------------------
+CFG_FILE="${ORADBCTL_CFG:-/etc/sysconfig/oradbctl}"
+# shellcheck source=/dev/null
+[ -r "$CFG_FILE" ] && . "$CFG_FILE"
+
+ORATAB="${ORADBCTL_ORATAB:-/etc/oratab}"
+LOG_DIR="${ORADBCTL_LOG_DIR:-/var/log/oradbctl}"
+LOG_KEEP_DAYS="${ORADBCTL_LOG_KEEP_DAYS:-30}"   # 0 = never purge (use logrotate)
+LOCK_DIR="${ORADBCTL_LOCK_DIR:-/var/tmp/oradbctl}"
+STANDBY_OPEN="${ORADBCTL_STANDBY_OPEN:-READ_ONLY}"
+START_TIMEOUT="${ORADBCTL_START_TIMEOUT:-900}"
+STOP_TIMEOUT="${ORADBCTL_STOP_TIMEOUT:-600}"
+ABORT_ON_TIMEOUT="${ORADBCTL_ABORT_ON_TIMEOUT:-1}"
+WITH_LISTENER="${ORADBCTL_WITH_LISTENER:-1}"
+PARALLEL="${ORADBCTL_PARALLEL:-1}"
+OWNER="${ORADBCTL_OWNER:-}"
+LISTENERS_OVERRIDE="${ORADBCTL_LISTENERS:-}"
+QUIET=0
+JSON=0
+ONLY=""
+EXCLUDE=""
+LOGFILE=""
+RESDIR=""
+
+usage() {
+  awk 'NR==1{next} /^#={5,}/{n++; if(n>=2) exit; next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"
+}
+
+#--- argument parsing ----------------------------------------------------------
+ORIG_ARGS=("$@")            # kept verbatim for the re-exec as the oracle user
+ACTION="${1:-}"
+case "$ACTION" in
+  start|stop|restart|status) shift ;;
+  -h|--help)    usage; exit 0 ;;
+  -V|--version) printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+  *) printf 'ERROR: expected start|stop|restart|status\n\n' >&2; usage >&2; exit 2 ;;
+esac
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--db)          ONLY="${2:-}";     shift 2 ;;
+    -x|--exclude)     EXCLUDE="${2:-}";  shift 2 ;;
+    -P|--parallel)    PARALLEL="${2:-1}";shift 2 ;;
+    -t|--timeout)     START_TIMEOUT="${2:-900}"; STOP_TIMEOUT="$START_TIMEOUT"; shift 2 ;;
+    --with-listener)  WITH_LISTENER=1;   shift ;;
+    --no-listener)    WITH_LISTENER=0;   shift ;;
+    --abort)          ABORT_ON_TIMEOUT=1;shift ;;
+    --no-abort)       ABORT_ON_TIMEOUT=0;shift ;;
+    --standby-open)   STANDBY_OPEN="$(printf '%s' "${2:-}" | tr 'a-z' 'A-Z')"; shift 2 ;;
+    -j|--json)        JSON=1;            shift ;;
+    -q|--quiet)       QUIET=1;           shift ;;
+    -h|--help)        usage; exit 0 ;;
+    -V|--version)     printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    *) printf 'ERROR: unknown option: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+case "$STANDBY_OPEN" in READ_ONLY|MOUNT) ;; *) printf 'ERROR: --standby-open must be read_only|mount\n' >&2; exit 2 ;; esac
+case "$PARALLEL" in ''|*[!0-9]*) printf 'ERROR: --parallel must be numeric\n' >&2; exit 2 ;; esac
+[ "$PARALLEL" -lt 1 ] && PARALLEL=1
+
+[ -r "$ORATAB" ] || { printf 'ERROR: %s not readable\n' "$ORATAB" >&2; exit 2; }
+
+#--- logging -------------------------------------------------------------------
+# fd 3 = human console channel. It is a *copy* of stdout (stderr in --json mode)
+# so that log lines never leak into $(...) captures of function results.
+if [ "$JSON" -eq 1 ]; then exec 3>&2; else exec 3>&1; fi
+log() {
+  local line; line="[$(date '+%F %T')] $*"
+  [ -n "$LOGFILE" ] && printf '%s\n' "$line" >>"$LOGFILE" 2>/dev/null
+  [ "$QUIET" -eq 1 ] || printf '%s\n' "$line" >&3
+}
+die() { log "FATAL: $*"; exit 2; }
+
+#--- oratab --------------------------------------------------------------------
+# prints "SID:ORACLE_HOME" for every entry flagged Y (ASM/-MGMTDB/* skipped)
+parse_oratab() {
+  awk -F: '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    NF < 3 { next }
+    {
+      sid=$1; oh=$2; flag=toupper(substr($3,1,1))
+      gsub(/^[ \t]+|[ \t]+$/,"",sid); gsub(/^[ \t]+|[ \t]+$/,"",oh)
+      if (sid ~ /^[+*-]/) next
+      if (sid == "" || oh == "" || flag != "Y") next
+      print sid ":" oh
+    }' "$ORATAB"
+}
+
+in_csv() { case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+
+#--- privilege drop ------------------------------------------------------------
+if [ "$(id -u)" -eq 0 ] && [ "${ORADBCTL_REEXEC:-0}" != "1" ]; then
+  if [ -z "$OWNER" ]; then
+    _first_oh="$(parse_oratab | head -1 | cut -d: -f2-)"
+    [ -n "$_first_oh" ] && [ -x "$_first_oh/bin/oracle" ] && OWNER="$(stat -c %U "$_first_oh/bin/oracle")"
+    OWNER="${OWNER:-oracle}"
+  fi
+  id "$OWNER" >/dev/null 2>&1 || { printf 'ERROR: user %s does not exist\n' "$OWNER" >&2; exit 2; }
+  mkdir -p "$LOG_DIR" "$LOCK_DIR" 2>/dev/null
+  chown "$OWNER" "$LOG_DIR" "$LOCK_DIR" 2>/dev/null
+  _home="$(getent passwd "$OWNER" | cut -d: -f6)"; _home="${_home:-/home/$OWNER}"
+  # runuser (util-linux, present on RHEL/OL 8+) does NOT run the login profile,
+  # so nothing from ~/.bash_profile can pollute stdout / the --json output.
+  if command -v runuser >/dev/null 2>&1; then
+    exec runuser -u "$OWNER" -- env "HOME=$_home" "USER=$OWNER" "LOGNAME=$OWNER" \
+         ORADBCTL_REEXEC=1 "ORADBCTL_CFG=$CFG_FILE" "$SELF" "${ORIG_ARGS[@]}"
+  fi
+  exec /bin/su -s /bin/bash "$OWNER" -c \
+       "$(printf '%q ' env "HOME=$_home" ORADBCTL_REEXEC=1 "ORADBCTL_CFG=$CFG_FILE" "$SELF" "${ORIG_ARGS[@]}")"
+fi
+
+mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="/tmp"
+mkdir -p "$LOCK_DIR" 2>/dev/null || LOCK_DIR="/tmp"
+LOGFILE="$LOG_DIR/oradbctl-$(date '+%Y%m%d').log"
+: >>"$LOGFILE" 2>/dev/null || LOGFILE=""
+
+# self-cleaning: drop own log files older than LOG_KEEP_DAYS. Name pattern is
+# anchored so nothing else in the directory can ever be matched.
+if [ -n "$LOGFILE" ] && [ "$LOG_KEEP_DAYS" -gt 0 ] 2>/dev/null; then
+  find "$LOG_DIR" -maxdepth 1 -type f -name 'oradbctl-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].log' \
+       -mtime "+$LOG_KEEP_DAYS" -delete 2>/dev/null
+  find "$LOCK_DIR" -maxdepth 1 -type f -name '*.lock' -mtime +30 -delete 2>/dev/null
+fi
+
+RESDIR="$(mktemp -d "${TMPDIR:-/tmp}/oradbctl.XXXXXX")" || die "cannot create temp dir"
+trap 'rm -rf "$RESDIR"' EXIT INT TERM
+
+#--- oracle environment --------------------------------------------------------
+set_env() {           # $1=SID  $2=ORACLE_HOME
+  ORACLE_SID="$1"; ORACLE_HOME="$2"
+  export ORACLE_SID ORACLE_HOME
+  export PATH="$ORACLE_HOME/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export LD_LIBRARY_PATH="$ORACLE_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export NLS_LANG="AMERICAN_AMERICA.AL32UTF8"   # keep ORA- messages parseable
+  unset TWO_TASK ORACLE_PATH SQLPATH
+}
+
+pmon_running() {      # $1=SID
+  pgrep -f "^(ora|xe)_pmon_$1\$" >/dev/null 2>&1 || pgrep -x "ora_pmon_$1" >/dev/null 2>&1
+}
+
+# SQL on stdin. $1 = timeout seconds. rc: 0 ok / 1 ORA- error / 124 timeout
+sql_run() {
+  local to="$1" out rc
+  out="$( { printf 'set echo off feedback off heading off verify off pagesize 0 linesize 32767 trimspool on serveroutput off\nwhenever oserror exit 9\n'
+            cat
+            printf '\nexit\n'; } | timeout -k 15 "$to" "$ORACLE_HOME/bin/sqlplus" -S -L '/ as sysdba' 2>&1 3>&- 9>&- )"
+  rc=$?
+  printf '%s\n' "$out"
+  [ "$rc" -eq 124 ] && return 124
+  printf '%s\n' "$out" | grep -qE '^(ORA-|SP2-|TNS-|ORA_)' && return 1
+  return "$rc"
+}
+
+sql_first_err() { printf '%s\n' "$1" | grep -m1 -E '^(ORA-|SP2-|TNS-)' | tr -d '\r'; }
+
+# echoes "STATUS|ROLE|OPEN_MODE|APPLY"   (APPLY = YES/NO/-)
+probe() {
+  local out line
+  pmon_running "$ORACLE_SID" || { printf 'DOWN|-|-|-\n'; return 0; }
+  out="$(sql_run 60 <<'EOSQL'
+select 'P1|'||i.status||'|'||replace(d.database_role,' ','_')||'|'||replace(d.open_mode,' ','_')||'|'||
+       (select decode(count(*),0,'NO','YES') from v$managed_standby where process like 'MRP%')
+  from v$instance i, v$database d;
+EOSQL
+)"
+  line="$(printf '%s\n' "$out" | grep -m1 '^P1|' | tr -d '\r')"
+  if [ -n "$line" ]; then printf '%s\n' "${line#P1|}"; return 0; fi
+  # NOMOUNT (v$database not available yet) or unreachable
+  out="$(sql_run 60 <<'EOSQL'
+select 'P2|'||status from v$instance;
+EOSQL
+)"
+  line="$(printf '%s\n' "$out" | grep -m1 '^P2|' | tr -d '\r')"
+  if [ -n "$line" ]; then printf '%s|-|-|-\n' "${line#P2|}"; return 0; fi
+  printf 'UNKNOWN|-|-|-\n'
+}
+
+field() { printf '%s\n' "$1" | cut -d'|' -f"$2"; }
+
+#--- start ---------------------------------------------------------------------
+db_start() {          # $1=SID  $2=OH ; echoes result token
+  local sid="$1" oh="$2" out rc st role changed=0
+  set_env "$sid" "$oh"
+
+  [ -x "$oh/bin/sqlplus" ] || { log "$sid: ERROR ORACLE_HOME invalid ($oh)"; printf 'failed'; return 1; }
+
+  if pmon_running "$sid"; then
+    st="$(field "$(probe)" 1)"
+    if [ "$st" = "OPEN" ]; then
+      log "$sid: already OPEN"
+      ensure_apply "$sid"; printf 'ok'; return 0
+    fi
+    log "$sid: instance present (status=$st), continuing startup"
+  else
+    log "$sid: STARTUP MOUNT"
+    out="$(sql_run "$START_TIMEOUT" <<<'startup mount;')"; rc=$?
+    if [ "$rc" -eq 124 ]; then log "$sid: ERROR startup timed out after ${START_TIMEOUT}s"; printf 'failed'; return 1; fi
+    if [ "$rc" -ne 0 ]; then log "$sid: ERROR startup failed - $(sql_first_err "$out")"; printf 'failed'; return 1; fi
+    changed=1
+  fi
+
+  # make sure we are at least mounted
+  st="$(field "$(probe)" 1)"
+  if [ "$st" = "STARTED" ]; then
+    out="$(sql_run "$START_TIMEOUT" <<<'alter database mount;')" || {
+      log "$sid: ERROR mount failed - $(sql_first_err "$out")"; printf 'failed'; return 1; }
+    changed=1
+  fi
+
+  role="$(field "$(probe)" 2)"
+  case "$role" in
+    PHYSICAL_STANDBY)
+      if [ "$STANDBY_OPEN" = "READ_ONLY" ]; then
+        log "$sid: physical standby -> OPEN READ ONLY"
+        out="$(sql_run "$START_TIMEOUT" <<<'alter database open read only;')" || {
+          log "$sid: ERROR open read only failed - $(sql_first_err "$out")"; printf 'failed'; return 1; }
+      else
+        log "$sid: physical standby -> staying MOUNTED"
+      fi
+      start_mrp "$sid" || { printf 'failed'; return 1; }
+      changed=1
+      ;;
+    LOGICAL_STANDBY)
+      log "$sid: logical standby -> OPEN + start apply"
+      out="$(sql_run "$START_TIMEOUT" <<<'alter database open;')" || {
+        log "$sid: ERROR open failed - $(sql_first_err "$out")"; printf 'failed'; return 1; }
+      sql_run 120 <<<'alter database start logical standby apply immediate;' >/dev/null 2>&1
+      changed=1
+      ;;
+    *)  # PRIMARY, SNAPSHOT_STANDBY, or role unavailable
+      log "$sid: role=$role -> OPEN"
+      out="$(sql_run "$START_TIMEOUT" <<<'alter database open;')"; rc=$?
+      if [ "$rc" -ne 0 ]; then
+        log "$sid: ERROR open failed - $(sql_first_err "$out")"; printf 'failed'; return 1
+      fi
+      changed=1
+      ;;
+  esac
+
+  st="$(probe)"
+  log "$sid: started (status=$(field "$st" 1) role=$(field "$st" 2) open_mode=$(field "$st" 3) apply=$(field "$st" 4))"
+  [ "$changed" -eq 1 ] && printf 'changed' || printf 'ok'
+  return 0
+}
+
+start_mrp() {         # $1=SID
+  local sid="$1" out
+  if [ "$(field "$(probe)" 4)" = "YES" ]; then log "$sid: redo apply already running"; return 0; fi
+  log "$sid: starting redo apply (MRP)"
+  out="$(sql_run 180 <<<'alter database recover managed standby database using current logfile disconnect from session;')"
+  if [ $? -ne 0 ]; then
+    log "$sid: real-time apply not possible ($(sql_first_err "$out")), falling back to archive apply"
+    out="$(sql_run 180 <<<'alter database recover managed standby database disconnect from session;')" || {
+      log "$sid: ERROR could not start redo apply - $(sql_first_err "$out")"; return 1; }
+  fi
+  return 0
+}
+
+ensure_apply() {      # $1=SID ; idempotent apply check on an already-open standby
+  local sid="$1" p; p="$(probe)"
+  [ "$(field "$p" 2)" = "PHYSICAL_STANDBY" ] || return 0
+  [ "$(field "$p" 4)" = "YES" ] && return 0
+  start_mrp "$sid"
+}
+
+#--- stop ----------------------------------------------------------------------
+db_stop() {           # $1=SID  $2=OH
+  local sid="$1" oh="$2" out rc p role
+  set_env "$sid" "$oh"
+
+  if ! pmon_running "$sid"; then log "$sid: already down"; printf 'ok'; return 0; fi
+  [ -x "$oh/bin/sqlplus" ] || { log "$sid: ERROR ORACLE_HOME invalid ($oh)"; printf 'failed'; return 1; }
+
+  p="$(probe)"; role="$(field "$p" 2)"
+  case "$role" in
+    PHYSICAL_STANDBY)
+      log "$sid: cancelling redo apply"
+      sql_run 300 <<<'alter database recover managed standby database cancel;' >/dev/null 2>&1
+      ;;
+    LOGICAL_STANDBY)
+      log "$sid: stopping logical standby apply"
+      sql_run 300 <<<'alter database stop logical standby apply;' >/dev/null 2>&1
+      ;;
+  esac
+
+  log "$sid: SHUTDOWN IMMEDIATE"
+  out="$(sql_run "$STOP_TIMEOUT" <<<'shutdown immediate')"; rc=$?
+
+  if [ "$rc" -eq 0 ] && ! pmon_running "$sid"; then
+    log "$sid: stopped cleanly"; printf 'changed'; return 0
+  fi
+
+  [ "$rc" -eq 124 ] && log "$sid: WARN shutdown immediate exceeded ${STOP_TIMEOUT}s"
+  [ "$rc" -eq 1 ]   && log "$sid: WARN shutdown immediate reported $(sql_first_err "$out")"
+
+  if ! pmon_running "$sid"; then log "$sid: stopped"; printf 'changed'; return 0; fi
+
+  if [ "$ABORT_ON_TIMEOUT" -eq 1 ]; then
+    log "$sid: SHUTDOWN ABORT"
+    sql_run 300 <<<'shutdown abort' >/dev/null 2>&1
+    sleep 3
+    if pmon_running "$sid"; then
+      log "$sid: ERROR still running after abort"; printf 'failed'; return 1
+    fi
+    log "$sid: stopped (aborted)"; printf 'changed'; return 0
+  fi
+
+  log "$sid: ERROR could not stop (abort disabled)"; printf 'failed'; return 1
+}
+
+#--- listeners -----------------------------------------------------------------
+# prints "LISTENER_NAME:ORACLE_HOME", de-duplicated by name
+collect_listeners() {
+  local oh ta f names n seen=""
+  local homes; homes="$(parse_oratab | cut -d: -f2- | sort -u)"
+  [ -z "$homes" ] && return 0
+  if [ -n "$LISTENERS_OVERRIDE" ]; then
+    oh="$(printf '%s\n' "$homes" | head -1)"
+    printf '%s' "$LISTENERS_OVERRIDE" | tr ',' '\n' | while read -r n; do
+      [ -n "$n" ] && printf '%s:%s\n' "$n" "$oh"
+    done
+    return 0
+  fi
+  while read -r oh; do
+    [ -x "$oh/bin/lsnrctl" ] || continue
+    ta="${TNS_ADMIN:-$oh/network/admin}"; f="$ta/listener.ora"
+    if [ -r "$f" ]; then
+      names="$(grep -E '^[[:space:]]*[A-Za-z][A-Za-z0-9_]*[[:space:]]*=' "$f" \
+               | sed 's/=.*//' | tr -d ' \t' | tr 'a-z' 'A-Z' \
+               | grep -vE '^(SID_LIST_|ADR_BASE|TRACE_|LOG_|DIAG_|SSL_|WALLET|SUBSCRIBE|USE_|ENABLE_|DEFAULT_SERVICE|ADMIN_RESTRICTIONS|VALID_NODE|DYNAMIC_REGISTRATION|PASSWORDS_|SAVE_CONFIG|INBOUND_CONNECT|SECURE_|CRS_|IFILE|CONNECTION_RATE|REGISTRATION_INVITED|FIREWALL|MAX_|NAMES\.|SQLNET)' \
+               | sort -u)"
+    else
+      names="LISTENER"
+    fi
+    [ -z "$names" ] && names="LISTENER"
+    for n in $names; do
+      in_csv "$n" "$seen" && continue
+      seen="$seen,$n"
+      printf '%s:%s\n' "$n" "$oh"
+    done
+  done <<<"$homes"
+}
+
+lsnr_action() {       # $1=start|stop  $2=NAME  $3=OH
+  local act="$1" name="$2" oh="$3" rc
+  ORACLE_HOME="$oh"; export ORACLE_HOME
+  export PATH="$oh/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export LD_LIBRARY_PATH="$oh/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  # 3>&- 9>&- : tnslsnr is forked from lsnrctl and keeps every inherited fd for
+  # its whole life - never let it hold our console fd or a lock fd.
+  "$oh/bin/lsnrctl" status "$name" >/dev/null 2>&1 3>&- 9>&-; rc=$?
+  if [ "$act" = "start" ]; then
+    [ "$rc" -eq 0 ] && { log "listener $name: already running"; return 0; }
+    log "listener $name: starting"
+    if timeout -k 10 120 "$oh/bin/lsnrctl" start "$name" >>"${LOGFILE:-/dev/null}" 2>&1 3>&- 9>&- </dev/null; then
+      log "listener $name: started"; return 0
+    fi
+    log "listener $name: ERROR start failed"; return 1
+  else
+    [ "$rc" -ne 0 ] && { log "listener $name: already down"; return 0; }
+    log "listener $name: stopping"
+    if timeout -k 10 120 "$oh/bin/lsnrctl" stop "$name" >>"${LOGFILE:-/dev/null}" 2>&1 3>&- 9>&- </dev/null; then
+      log "listener $name: stopped"; return 0
+    fi
+    log "listener $name: ERROR stop failed"; return 1
+  fi
+}
+
+listeners_all() {     # $1=start|stop
+  local rc=0 entry name oh
+  [ "$WITH_LISTENER" -eq 1 ] || return 0
+  while read -r entry; do
+    [ -z "$entry" ] && continue
+    name="${entry%%:*}"; oh="${entry#*:}"
+    ( lsnr_action "$1" "$name" "$oh" ) || rc=1
+  done < <(collect_listeners)
+  return $rc
+}
+
+#--- locking -------------------------------------------------------------------
+# PIDs belonging to THIS run (current subshell up to the main script), so we
+# never mistake our own open descriptor for a foreign lock holder.
+own_pids() {
+  local p="$BASHPID"
+  while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null; do
+    printf '%s\n' "$p"
+    [ "$p" = "$$" ] && break
+    p="$(sed 's/^.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $2}')"
+  done
+}
+
+# Foreign holders of an open descriptor on $1 -> "pid:comm" per line.
+# Only reached on the rare "lock busy" path, so the /proc walk costs nothing.
+# Call it with 9>&- so the helper's own children cannot show up as holders.
+lock_holders() {
+  local tgt="$1" own d p link
+  own=" $(own_pids | tr '\n' ' ')"
+  for d in /proc/[0-9]*; do
+    p="${d#/proc/}"
+    case "$own" in *" $p "*) continue ;; esac
+    for link in "$d"/fd/*; do
+      [ -e "$link" ] || continue
+      if [ "$(readlink "$link" 2>/dev/null)" = "$tgt" ]; then
+        printf '%s:%s\n' "$p" "$(cat "$d/comm" 2>/dev/null)"
+        break
+      fi
+    done
+  done 2>/dev/null
+}
+
+# "53 processes: ora_pmon_db1, ora_dbw0_db1, ora_lgwr_db1, ..." - a full dump of
+# an instance's background processes is unreadable and bloats the log file.
+holder_summary() {
+  local n head
+  n="$(printf '%s\n' "$1" | grep -c .)"
+  head="$(printf '%s\n' "$1" | head -3 | cut -d: -f2 | paste -sd, -)"
+  if [ "$n" -gt 3 ]; then printf '%s process(es): %s, ...' "$n" "$head"
+  else printf '%s process(es): %s' "$n" "$head"; fi
+}
+
+#--- per-database dispatch (locked, isolated in a subshell) --------------------
+run_one() {           # $1=action $2=SID $3=OH
+  local act="$1" sid="$2" oh="$3"
+  local lf="$LOCK_DIR/$sid.lock"
+  (
+    exec 9>"$lf"
+    if ! flock -n 9 2>/dev/null; then
+      # A lock can only look busy for two reasons: a genuine concurrent
+      # oradbctl run, or a descriptor that leaked into long-lived Oracle
+      # processes. Tell them apart instead of blocking forever.
+      holders="$(lock_holders "$lf" 9>&-)"
+      if [ -n "$holders" ] && ! printf '%s\n' "$holders" | grep -qvE ':(ora_|oracle$|tnslsnr)'; then
+        log "$sid: stale lock left behind by an older oradbctl, held by $(holder_summary "$holders") - reclaiming"
+        rm -f "$lf"
+        exec 9>"$lf"
+        flock -n 9 2>/dev/null || { log "$sid: SKIPPED - lock still busy"; \
+          printf '%s|skipped|-|-|-|-\n' "$sid" >"$RESDIR/$sid.res"; exit 0; }
+      else
+        log "$sid: SKIPPED - another oradbctl run holds the lock${holders:+ ($(holder_summary "$holders"))}"
+        printf '%s|skipped|-|-|-|-\n' "$sid" >"$RESDIR/$sid.res"
+        exit 0
+      fi
+    fi
+    local res p
+    case "$act" in
+      start) res="$(db_start "$sid" "$oh")" ;;
+      stop)  res="$(db_stop  "$sid" "$oh")" ;;
+      status)
+             set_env "$sid" "$oh"
+             p="$(probe)"
+             printf '%s|ok|%s\n' "$sid" "$p" >"$RESDIR/$sid.res"
+             if [ "$JSON" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+               printf '%-16s %-9s %-18s %-21s %s\n' "$sid" "$(field "$p" 1)" "$(field "$p" 2)" "$(field "$p" 3)" "$(field "$p" 4)"
+             fi
+             exit 0 ;;
+    esac
+    set_env "$sid" "$oh"
+    p="$(probe)"
+    printf '%s|%s|%s\n' "$sid" "$res" "$p" >"$RESDIR/$sid.res"
+    [ "$res" = "failed" ] && exit 1
+    exit 0
+  )
+}
+
+run_all() {           # $1=action  $2..=entries
+  local act="$1"; shift
+  local rc=0 entry sid oh pids=() sids=() i
+  if [ "$PARALLEL" -le 1 ]; then
+    for entry in "$@"; do
+      sid="${entry%%:*}"; oh="${entry#*:}"
+      run_one "$act" "$sid" "$oh" || rc=1
+    done
+  else
+    for entry in "$@"; do
+      while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL" ]; do sleep 1; done
+      sid="${entry%%:*}"; oh="${entry#*:}"
+      run_one "$act" "$sid" "$oh" &
+      pids+=("$!"); sids+=("$sid")
+    done
+    for i in "${!pids[@]}"; do wait "${pids[$i]}" || rc=1; done
+  fi
+  return $rc
+}
+
+#--- JSON summary --------------------------------------------------------------
+emit_json() {         # $1=action $2=rc
+  local f sid res st role om ap first=1
+  printf '{"action":"%s","host":"%s","rc":%s,"changed":' "$1" "$HOSTNAME_S" "$2"
+  if grep -hq '|changed|' "$RESDIR"/*.res 2>/dev/null; then printf 'true'; else printf 'false'; fi
+  printf ',"databases":['
+  for f in "$RESDIR"/*.res; do
+    [ -e "$f" ] || continue
+    IFS='|' read -r sid res st role om ap <"$f"
+    [ "$first" -eq 1 ] || printf ','
+    first=0
+    printf '{"sid":"%s","result":"%s","status":"%s","role":"%s","open_mode":"%s","apply":"%s"}' \
+           "$sid" "$res" "$st" "$role" "$om" "$ap"
+  done
+  printf ']}\n'
+}
+
+#===============================================================================
+# main
+#===============================================================================
+mapfile -t ENTRIES < <(parse_oratab)
+
+# filters
+FILTERED=()
+for e in "${ENTRIES[@]:-}"; do
+  [ -z "$e" ] && continue
+  s="${e%%:*}"
+  [ -n "$ONLY" ]    && { in_csv "$s" "$ONLY"    || continue; }
+  [ -n "$EXCLUDE" ] && { in_csv "$s" "$EXCLUDE" && continue; }
+  FILTERED+=("$e")
+done
+
+if [ "${#FILTERED[@]}" -eq 0 ]; then
+  if [ -n "$ONLY" ]; then
+    # explicit -d list matched nothing -> almost always a typo or a missing 'Y'
+    log "ERROR: none of '$ONLY' is present in $ORATAB with flag 'Y'"
+    [ "$JSON" -eq 1 ] && emit_json "$ACTION" 2
+    exit 2
+  fi
+  log "no database in $ORATAB is flagged 'Y' - nothing to do"
+  [ "$JSON" -eq 1 ] && emit_json "$ACTION" 0
+  exit 0
+fi
+
+RC=0
+case "$ACTION" in
+  status)
+    [ "$QUIET" -eq 1 ] || [ "$JSON" -eq 1 ] || \
+      printf '%-16s %-9s %-18s %-21s %s\n' "SID" "STATUS" "ROLE" "OPEN_MODE" "APPLY"
+    PARALLEL=1
+    run_all status "${FILTERED[@]}" || RC=1
+    if [ "$WITH_LISTENER" -eq 1 ] && [ "$JSON" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+      while read -r entry; do
+        [ -z "$entry" ] && continue
+        n="${entry%%:*}"; oh="${entry#*:}"
+        if ( export ORACLE_HOME="$oh" LD_LIBRARY_PATH="$oh/lib"; "$oh/bin/lsnrctl" status "$n" >/dev/null 2>&1 ); then
+          printf '%-16s %s\n' "$n" "RUNNING"
+        else
+          printf '%-16s %s\n' "$n" "DOWN"
+        fi
+      done < <(collect_listeners)
+    fi
+    ;;
+  start)
+    log "=== START (${#FILTERED[@]} database(s), parallel=$PARALLEL, standby_open=$STANDBY_OPEN) ==="
+    listeners_all start || RC=1
+    run_all start "${FILTERED[@]}" || RC=1
+    log "=== START finished rc=$RC ==="
+    ;;
+  stop)
+    log "=== STOP (${#FILTERED[@]} database(s), parallel=$PARALLEL, abort_on_timeout=$ABORT_ON_TIMEOUT) ==="
+    run_all stop "${FILTERED[@]}" || RC=1
+    listeners_all stop || RC=1
+    log "=== STOP finished rc=$RC ==="
+    ;;
+  restart)
+    log "=== RESTART (${#FILTERED[@]} database(s)) ==="
+    run_all stop "${FILTERED[@]}" || RC=1
+    listeners_all stop || RC=1
+    listeners_all start || RC=1
+    run_all start "${FILTERED[@]}" || RC=1
+    log "=== RESTART finished rc=$RC ==="
+    ;;
+esac
+
+[ "$JSON" -eq 1 ] && emit_json "$ACTION" "$RC"
+exit "$RC"
