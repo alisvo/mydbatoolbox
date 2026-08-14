@@ -2,31 +2,77 @@
 
 ## Install
 
+Run all of this as root.
+
+**1. Place the script on a path the `oracle` user can reach**
+
 ```bash
 install -o root -g root -m 0755 oradbctl /usr/local/bin/oradbctl
+```
+
+Mode `0755` matters: started as root the script re-execs itself as the Oracle software owner using its
+own path, so that user needs read+execute on the file.
+
+**2. Create the log and lock directories**
+
+```bash
 mkdir -p /var/log/oradbctl /var/tmp/oradbctl
 chown oracle:oinstall /var/log/oradbctl /var/tmp/oradbctl
+chmod 0750 /var/log/oradbctl /var/tmp/oradbctl
+```
 
-# optional site defaults
+If `/var/log/oradbctl` is missing or not writable by `oracle`, logging silently falls back to `/tmp`
+instead of failing — easy to miss, so don't skip this.
+
+**3. Optional site defaults**
+
+```bash
 cat > /etc/sysconfig/oradbctl <<'EOF'
 ORADBCTL_PARALLEL=4
-ORADBCTL_STANDBY_OPEN=READ_ONLY      # or MOUNT
+ORADBCTL_STANDBY_OPEN=READ_ONLY      # MOUNT if the host is not ADG-licensed
 ORADBCTL_STOP_TIMEOUT=600
 ORADBCTL_ABORT_ON_TIMEOUT=1
+ORADBCTL_LOG_KEEP_DAYS=30
 EOF
 ```
 
-Runs as root (drops to the Oracle software owner via `runuser`) or directly as `oracle`.
-Only `/etc/oratab` entries flagged **Y** are touched; `+ASM*`, `-MGMTDB`, `*` and `N` entries are skipped.
+**4. Check what oratab will drive**
 
-Quick check: `oradbctl status`
+```bash
+grep -v '^#' /etc/oratab
+```
+
+Only entries flagged **Y** are touched; `+ASM*`, `-MGMTDB`, `*` and `N` entries are skipped.
+
+**5. Verify**
+
+```bash
+oradbctl -V                      # oradbctl 1.1.2
+oradbctl status
+su - oracle -c 'oradbctl -V'     # must work as oracle too
+```
+
+`oradbctl status` on a healthy host:
 
 ```
-SID              STATUS    ROLE               OPEN_MODE      APPLY
-PRODDB           OPEN      PRIMARY            READ_WRITE     NO
-DWHDB            OPEN      PRIMARY            READ_WRITE     NO
-PRODSTB          OPEN      PHYSICAL_STANDBY   READ_ONLY      YES
+SID              STATUS    ROLE               OPEN_MODE             APPLY
+PRODDB           OPEN      PRIMARY            READ_WRITE            NO
+DWHDB            OPEN      PRIMARY            READ_WRITE            NO
+PRODSTB          OPEN      PHYSICAL_STANDBY   READ_ONLY_WITH_APPLY  YES
 LISTENER         RUNNING
+```
+
+Both invocation paths do the same work as the `oracle` user: as root it drops privileges via `runuser`,
+as `oracle` it runs directly.
+
+## Upgrading
+
+Overwrite the file — there is no state to migrate and the config, log and lock directories are compatible
+across versions.
+
+```bash
+install -o root -g root -m 0755 oradbctl /usr/local/bin/oradbctl
+oradbctl -V
 ```
 
 ## Exit codes
