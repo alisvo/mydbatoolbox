@@ -10,21 +10,21 @@
 -- On every change: bump it, describe the change in the block below, and move
 -- the previous block to the top of CHANGELOG.txt.
 -- =============================================================================
-DEFINE mon_version = "2.3.0"
+DEFINE mon_version = "2.3.1"
 
 -- -----------------------------------------------------------------------------
 -- THIS RELEASE ONLY - full history is in CHANGELOG.txt
 -- -----------------------------------------------------------------------------
--- 2.3.0  2026-09-14
---        ~ "BACKUP DOESNT EXIST" now runs on the PRIMARY only. Backups are taken
---          on the primary; a standby controlfile can still carry stale RMAN
---          records inherited from it, which is why the check fired on one
---          standby and stayed silent on another.
---        ! Same check: HAVING MAX(end_time) < SYSDATE-1 compared NULL when there
---          was no backup record at all, so a database that had NEVER been backed
---          up looked healthy. Rewritten with an inline view plus NVL so "no
---          backup ever" alerts. The role test is in the OUTER query - inside the
---          aggregate it would have produced a false alert on every standby.
+-- 2.3.1  2026-09-14
+--        ! Removed the "Standby Apply Progress seen from Primary" section. It
+--          compared ARCHIVED_SEQ# with APPLIED_SEQ# in V$ARCHIVE_DEST_STATUS,
+--          but APPLIED_SEQ# on the primary is only refreshed when the standby
+--          acknowledges, and real-time apply works from the standby redo logs
+--          before a log is archived. A healthy DR node therefore drifted by a
+--          few sequences and tripped the 3-log threshold (41921 vs 41917).
+--          Apply progress is now measured only on the standby, where it is a
+--          live figure: apply lag in minutes plus the local sequence gap.
+--          Transport health stays on the primary (destination status/gap_status).
 -- -----------------------------------------------------------------------------
 
 -- 1. SETUP (HTML IS OFF INITIALLY)
@@ -645,24 +645,19 @@ SELECT s.dest_id,
    AND (s.status <> 'VALID' OR NVL(s.gap_status, 'NO GAP') <> 'NO GAP');
 
 
-PROMPT <h3 class='dg'>Data Guard Standby Apply Progress seen from Primary (more than &dg_seq_gap logs)</h3>
-SELECT s.dest_id,
-       s.dest_name,
-       s.destination,
-       s.archived_seq#,
-       s.applied_seq#,
-       s.archived_seq# - s.applied_seq# logs_behind,
-       'SEND_MAIL' mail_check
-  FROM v$archive_dest_status s
- WHERE TRIM('&db_role') = 'PRIMARY'
-   AND s.destination IS NOT NULL
-   AND s.dest_id IN (SELECT d.dest_id
-                       FROM v$archive_dest d
-                      WHERE d.target = 'STANDBY'
-                        AND d.destination IS NOT NULL)
-   AND s.status = 'VALID'
-   AND NVL(s.applied_seq#, 0) > 0
-   AND s.archived_seq# - s.applied_seq# > &dg_seq_gap;
+-- REMOVED in 2.3.1: "Standby Apply Progress seen from Primary".
+-- It compared ARCHIVED_SEQ# with APPLIED_SEQ# in V$ARCHIVE_DEST_STATUS on the
+-- primary. APPLIED_SEQ# there is not a live figure - the primary only learns it
+-- when the standby acknowledges - and with real-time apply the standby applies
+-- redo straight from the standby redo logs, before the log is archived. During
+-- normal log switching the two columns therefore drift by a few sequences on a
+-- standby that is perfectly in sync, which produced a false alert (41921 vs
+-- 41917) on a healthy DR node.
+-- Apply progress is measured on the standby instead, where it is real: the
+-- "Data Guard Lag" section reads apply lag in minutes from V$DATAGUARD_STATS,
+-- and the sequence gap section reads V$ARCHIVED_LOG locally. The same script
+-- runs on both nodes, so nothing is left uncovered. Transport health stays on
+-- the primary in the "Transport Destinations" section (status, gap_status).
 
 
 PROMPT <h3 class='dg'>Data Guard Messages (Last &dg_msg_window_min min)</h3>
