@@ -24,10 +24,17 @@ SQL_SCRIPT="monitoring.sql"
 # Set to 0 to keep everything forever.
 LOG_RETENTION_DAYS=30
 
+# Last line of defence on mail size. monitoring.sql already caps its unbounded
+# sections, so this should never fire - but an oversized mail can be rejected by
+# the SMTP server, and a monitoring alert that never arrives is the worst
+# possible outcome. Beyond this the body is cut and the mail says where the full
+# report was kept. Set to 0 to disable.
+MAX_MAIL_KB=512
+
 # Email Settings
-EMAIL_TO="dbmonitorteam@company.com"
-EMAIL_FROM="oracle_alerts@company.com"
-SMTP_URL="smtp://postacim.company.com:25"
+EMAIL_TO="databaseteam@mycomp.com"
+EMAIL_FROM="oraclealerting@mycomp.com"
+SMTP_URL="smtp://mailsender.mycomp.com:25"
 
 # Timestamp & Files
 TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
@@ -67,8 +74,28 @@ send_alert() {
     local subject="$1"
     local log_file="$2"
 
-    # 1. Check if the log contains error keywords (Case Insensitive)
-    if grep -iqE 'SEND_MAIL|error|ERROR|ORA-' "$log_file"; then
+    # 1. Decide whether this run is worth a mail.
+    #
+    #    CASE SENSITIVE and anchored on purpose. The old pattern was
+    #        grep -iqE 'SEND_MAIL|error|ERROR|ORA-'
+    #    which matched the word "error" ANYWHERE in the file, including inside
+    #    reported data. That made it impossible to print anything informational:
+    #    a Data Guard message whose severity reads "Error" mailed on its own,
+    #    even with no SEND_MAIL anywhere. Now:
+    #
+    #      SEND_MAIL      - a check deliberately raised an alert. The only
+    #                       trigger that comes from the report itself.
+    #      ^ERROR         - SQLPlus prints "ERROR at line N:" before a failed
+    #                       statement and "ERROR:" before a failed logon, both
+    #                       at the start of a line. This is the safety net that
+    #                       surfaces a broken script (bad column, bad
+    #                       ORACLE_HOME, logon denied). Data cells never match:
+    #                       the severity value is "Error", not "ERROR".
+    #      ^SP2-          - SQLPlus level failures, e.g. a missing script file.
+    #
+    #    A sqlplus binary that will not even start prints nothing we could grep,
+    #    so its exit code is checked separately below.
+    if [[ "$SQLPLUS_RC" -ne 0 ]] || grep -qE 'SEND_MAIL|^ERROR|^SP2-' "$log_file"; then
 
         echo "[ALERT] Issues detected on $ORACLE_SID. Preparing email..."
 
@@ -89,7 +116,21 @@ send_alert() {
         # 3. Append Body (Cleaning and Converting to CRLF)
         # sed -n '/<html>/,$p' : Drops everything BEFORE the first <html> tag
         # sed 's/$/\r/'        : Adds a Carriage Return to every line for SMTP compliance
-        sed -n '/<html>/,$p' "$log_file" | sed 's/$/\r/' >> "$email_temp"
+        local body_bytes
+        body_bytes=$(wc -c < "$log_file")
+
+        if [[ "$MAX_MAIL_KB" -gt 0 ]] && (( body_bytes > MAX_MAIL_KB * 1024 )); then
+            echo "[WARN] Report is $(( body_bytes / 1024 )) KB, cutting the mail at ${MAX_MAIL_KB} KB."
+            sed -n '/<html>/,$p' "$log_file" \
+                | head -c $(( MAX_MAIL_KB * 1024 )) \
+                | sed 's/$/\r/' >> "$email_temp"
+            # The log file is renamed to this path right after a successful send.
+            printf '<hr><p style="color:#8a4b00"><b>[MAIL TRUNCATED]</b> The report was %s KB and was cut at %s KB.<br>Full report on %s: %s</p>\r\n' \
+                   "$(( body_bytes / 1024 ))" "$MAX_MAIL_KB" "$HOST_SHORT" "${log_file}_${TIMESTAMP}" >> "$email_temp"
+            printf '</body></html>\r\n' >> "$email_temp"
+        else
+            sed -n '/<html>/,$p' "$log_file" | sed 's/$/\r/' >> "$email_temp"
+        fi
 
         # 4. Send via CURL
         curl --url "$SMTP_URL" \
@@ -119,8 +160,11 @@ send_alert() {
 # =============================================================================
 cd "$ORACLE_BASE" || exit 1
 
-# 1. Run SQLPlus
+# 1. Run SQLPlus. The exit code is kept: if sqlplus cannot start at all there
+#    is nothing in the log for grep to find, and a silent monitoring script is
+#    worse than a noisy one.
 sqlplus -s / as sysdba @"${SQL_SCRIPT}" > "$DB_LOG" 2>&1
+SQLPLUS_RC=$?
 
 # 2. Process Results
 send_alert "[Warning] DB Health Alert: ${ORACLE_SID} @ ${HOST_SHORT}" "$DB_LOG"
