@@ -10,21 +10,22 @@
 -- On every change: bump it, describe the change in the block below, and move
 -- the previous block to the top of CHANGELOG.txt.
 -- =============================================================================
-DEFINE mon_version = "2.3.1"
+DEFINE mon_version = "2.4.1"
 
 -- -----------------------------------------------------------------------------
 -- THIS RELEASE ONLY - full history is in CHANGELOG.txt
 -- -----------------------------------------------------------------------------
--- 2.3.1  2026-09-14
---        ! Removed the "Standby Apply Progress seen from Primary" section. It
---          compared ARCHIVED_SEQ# with APPLIED_SEQ# in V$ARCHIVE_DEST_STATUS,
---          but APPLIED_SEQ# on the primary is only refreshed when the standby
---          acknowledges, and real-time apply works from the standby redo logs
---          before a log is archived. A healthy DR node therefore drifted by a
---          few sequences and tripped the 3-log threshold (41921 vs 41917).
---          Apply progress is now measured only on the standby, where it is a
---          live figure: apply lag in minutes plus the local sequence gap.
---          Transport health stays on the primary (destination status/gap_status).
+-- 2.4.1  2026-09-14
+--        + Row caps on the two unbounded sections, so no single incident can
+--          produce a mail that is too large to read or to deliver:
+--            dg_msg_max_rows     = 20  (v$dataguard_status; a note above the
+--                                       table reports how many were suppressed)
+--            block_max_blockers  = 20  (blocking sessions)
+--            block_max_blocked   = 10  (blocked sessions listed per blocker)
+--          Data Guard message text also trimmed from 250 to 200 chars.
+--        + monitoring.sh: MAX_MAIL_KB (default 512) truncates the body if the
+--          report is still oversized, and says so in the mail together with the
+--          path of the full report kept in the log directory.
 -- -----------------------------------------------------------------------------
 
 -- 1. SETUP (HTML IS OFF INITIALLY)
@@ -48,13 +49,23 @@ SET MARKUP HTML OFF
 -- dg_apply_lag_min     : alert if redo apply lag exceeds N minutes
 -- dg_seq_gap           : alert if standby is more than N archive logs behind
 -- dg_stat_stale_min    : alert if v$dataguard_stats has not refreshed for N minutes
--- dg_msg_window_min    : look back N minutes in v$dataguard_status. Set equal to
---                        the cron interval (30) so each message mails ONCE. A
---                        larger value re-sends the same message on the next run.
--- dg_msg_severity      : which v$dataguard_status severities are worth a mail.
---                        Warning is deliberately EXCLUDED - it repeats every
---                        30 min for transient conditions. To include it again:
+-- dg_msg_window_min    : how far back to show v$dataguard_status events. These
+--                        are INFORMATIONAL since 2.4.0 - they no longer trigger
+--                        a mail - so the window is no longer tied to the cron
+--                        interval. 120 gives useful history in a mail that some
+--                        other check raised.
+-- dg_msg_severity      : which v$dataguard_status severities are shown. They no
+--                        longer cost anything in mail volume, so adding
+--                        'Warning' back is now free context if you want it:
 --                        DEFINE dg_msg_severity = "'Error','Fatal','Warning'"
+-- dg_msg_max_rows      : hard cap on how many v$dataguard_status rows are
+--                        printed. During a transport storm that view can hold
+--                        hundreds of entries; an unbounded section would make
+--                        the mail unusable, or too big to be delivered at all.
+--                        A note above the table says how many were suppressed.
+-- block_max_blockers /  : hard caps on the blocking-session section, the other
+-- block_max_blocked       genuinely unbounded part of the report. N blockers,
+--                         and N blocked sessions listed under each of them.
 -- dg_daily_from /       : window in which the CONFIG level checks are allowed to
 -- dg_daily_to             report (standby redo logs missing, force logging off).
 --                         Those two stay true until a DBA fixes them, so without
@@ -68,7 +79,10 @@ DEFINE dg_transport_lag_min = 15
 DEFINE dg_apply_lag_min = 30
 DEFINE dg_seq_gap = 3
 DEFINE dg_stat_stale_min = 30
-DEFINE dg_msg_window_min = 30
+DEFINE dg_msg_window_min = 120
+DEFINE dg_msg_max_rows = 20
+DEFINE block_max_blockers = 20
+DEFINE block_max_blocked = 10
 
 -- 2. GET VARIABLES (Silent Mode - No Empty Tables)
 COLUMN INSTANCE_NAME NEW_VALUE INSTANCE_NAME NOPRINT;
@@ -366,6 +380,7 @@ BEGIN
             b.sql_id,
             b.program
         ORDER BY MAX(s.seconds_in_wait) DESC
+        FETCH FIRST &block_max_blockers ROWS ONLY
    ) LOOP
 
         DBMS_OUTPUT.put_line(
@@ -405,6 +420,7 @@ BEGIN
                   AND s.blocking_session  = do_loop.session_id
                   AND s.seconds_in_wait > 300
                 ORDER BY s.seconds_in_wait DESC
+                FETCH FIRST &block_max_blocked ROWS ONLY
             ) LOOP
 
                 DBMS_OUTPUT.put_line(
@@ -660,18 +676,44 @@ SELECT s.dest_id,
 -- the primary in the "Transport Destinations" section (status, gap_status).
 
 
-PROMPT <h3 class='dg'>Data Guard Messages (Last &dg_msg_window_min min)</h3>
-SELECT facility,
-       severity,
-       message_num,
-       TO_CHAR(timestamp, 'DD-MON-YYYY HH24:MI:SS') event_time,
-       SUBSTR(message, 1, 250) dg_message,
-       'SEND_MAIL' mail_check
+-- INFORMATIONAL - deliberately carries NO mail_check column.
+--
+-- v$dataguard_status is an event log: it records that something happened at a
+-- point in time, not that anything is wrong now. Data Guard retries transport
+-- and fetches missing logs by itself, so a single "Error NNNNN archiving LNO:x"
+-- is usually already healed by the time anyone reads the mail - confirmed in
+-- the field, where such a message appeared while the standby showed no lag and
+-- the primary's destination status was VALID.
+--
+-- So these rows no longer trigger anything. They ride along in a mail that some
+-- OTHER check already raised, and answer the question that mail creates: what
+-- happened just before. If nothing else fired, nothing is sent.
+-- This only works because monitoring.sh greps for SEND_MAIL rather than for the
+-- word "error" anywhere in the file - see the comment on that grep.
+PROMPT <h3 class='dg'>Data Guard Messages (informational, last &dg_msg_window_min min)</h3>
+
+-- Shown only when the window held more messages than we print. During a
+-- transport storm this view can hold hundreds of entries and an unbounded
+-- section would produce a mail too big to be useful - or to be delivered.
+SELECT 'Showing the newest &dg_msg_max_rows of ' || COUNT(*)
+       || ' messages in the window. Full list: v$dataguard_status' note
   FROM v$dataguard_status
  WHERE TRIM('&dg_enabled') = 'YES'
    AND severity IN (&dg_msg_severity)
    AND timestamp > SYSDATE - &dg_msg_window_min/1440
- ORDER BY timestamp DESC;
+HAVING COUNT(*) > &dg_msg_max_rows;
+
+SELECT facility,
+       severity,
+       message_num,
+       TO_CHAR(timestamp, 'DD-MON-YYYY HH24:MI:SS') event_time,
+       SUBSTR(message, 1, 200) dg_message
+  FROM v$dataguard_status
+ WHERE TRIM('&dg_enabled') = 'YES'
+   AND severity IN (&dg_msg_severity)
+   AND timestamp > SYSDATE - &dg_msg_window_min/1440
+ ORDER BY timestamp DESC
+ FETCH FIRST &dg_msg_max_rows ROWS ONLY;
 
 
 -- 6. CLOSING TAGS
