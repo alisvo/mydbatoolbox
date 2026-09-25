@@ -1,0 +1,32 @@
+SELECT s.relname,
+       pg_size_pretty(pg_total_relation_size(s.relid))                   AS total_size,
+       pg_size_pretty(pg_relation_size(s.relid))                         AS table_size,
+       pg_size_pretty(pg_indexes_size(s.relid))                          AS index_size,
+       pg_size_pretty(coalesce(pg_total_relation_size(nullif(c.reltoastrelid, 0)), 0)) AS toast_size,
+       (SELECT count(*) FROM pg_index i WHERE i.indrelid = s.relid)       AS index_count,
+       s.n_live_tup,
+       s.n_dead_tup,
+       round(100.0 * s.n_dead_tup / nullif(s.n_live_tup + s.n_dead_tup, 0), 2) AS dead_pct,
+       round(pg_relation_size(s.relid)::numeric / nullif(s.n_live_tup, 0), 0)  AS bytes_per_row,
+       s.seq_scan,
+       s.seq_tup_read,
+       s.last_seq_scan,
+       s.idx_scan,
+       s.last_idx_scan,
+       s.n_tup_ins,
+       s.n_tup_upd,
+       s.n_tup_del,
+       s.n_tup_hot_upd,
+       round(100.0 * s.n_tup_hot_upd / nullif(s.n_tup_upd, 0), 1)         AS hot_pct,
+       s.n_mod_since_analyze,
+       s.last_vacuum,
+       s.last_autovacuum,
+       s.last_analyze,
+       s.last_autoanalyze,
+       s.autovacuum_count,
+       s.autoanalyze_count,
+       c.reloptions
+FROM pg_stat_user_tables s
+JOIN pg_class c ON c.oid = s.relid
+WHERE s.relname IN ('table_a', 'table_b')
+ORDER BY pg_total_relation_size(s.relid) DESC;
