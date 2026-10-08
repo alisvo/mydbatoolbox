@@ -1,0 +1,34 @@
+# /etc/systemd/system/oracle-db.service
+# kaynak: /home/oracle/scripts/oracle-db.service  ->  systemctl daemon-reload && systemctl enable --now oracle-db
+[Unit]
+Description=Oracle Database instances (oratab :Y)
+After=network-online.target local-fs.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=oracle
+Group=oinstall
+# systemd /etc/security/limits.conf'u OKUMAZ; Oracle limitlerini burada ver
+LimitNOFILE=65536
+LimitNPROC=16384
+LimitSTACK=33554432
+LimitMEMLOCK=infinity
+# ExecStart hata ile biterse systemd cgroup'taki TÜM süreçleri (açılmış instance'lar dahil)
+# öldürmesin diye:
+KillMode=process
+Environment=ORATAB=/etc/oratab
+#Environment="MOUNT_SIDS=STBY2"
+Environment=SHUTDOWN_TIMEOUT=600
+# Baştaki "-": bir DB açılamasa da unit "active" kalsın. Aksi halde unit "failed" olur
+# ve reboot'ta ExecStop (db_stop.sh) HİÇ çalışmaz -> açık DB'ler kill edilir.
+# Hatalar journal'da "HATA" satırlarıyla görünür: journalctl -u oracle-db
+ExecStart=-/home/oracle/scripts/db_start.sh
+ExecStop=-/home/oracle/scripts/db_stop.sh
+TimeoutStartSec=1800
+# DB'ler sırayla kapanır: (DB sayısı x (SHUTDOWN_TIMEOUT + ~60)) değerinden büyük olmalı
+TimeoutStopSec=3600
+
+[Install]
+WantedBy=multi-user.target
