@@ -1,6 +1,6 @@
 # RHEL/CentOS Ortamında `pg_upgrade` ile PostgreSQL Sürüm Yükseltme Rehberi
 
-PostgreSQL veritabanında "Major" (ana) sürüm güncellemeleri (örneğin 12'den 15'e) veritabanı dosyalarının fiziksel formatında değişiklikler içerdiği için basit bir paket güncellemesi ile yapılamaz. Geleneksel `pg_dumpall` / `pg_restore` yöntemi büyük veritabanları için saatler sürebilecekken, **`pg_upgrade`** aracı bu işlemi dakikalar, hatta `--link` modu ile saniyeler içinde tamamlamanızı sağlar.
+PostgreSQL veritabanında "Major" (ana) sürüm güncellemeleri (örneğin 12'den 15'e) veritabanı dosyalarının fiziksel formatında değişiklikler içerdiği için basit bir paket güncellemesi ile yapılamaz. Geleneksel `pg_dump` / `pg_restore` (veya `pg_dumpall` / `psql`) yöntemi büyük veritabanları için saatler sürebilecekken, **`pg_upgrade`** aracı bu işlemi dakikalar, hatta `--link` modu ile saniyeler içinde tamamlamanızı sağlar.
 
 Bu rehberde, Red Hat, CentOS, Rocky Linux veya Oracle Linux gibi RHEL tabanlı sistemler üzerindeki PostgreSQL sunucularınızı nasıl güvenle yükselteceğinizi adım adım inceleyeceğiz.
 
@@ -16,16 +16,22 @@ Herhangi bir major upgrade işlemine başlamadan önce aşağıdaki adımları e
 
 Aşağıdaki senaryoda mevcut sürümümüzün **12**, hedeflediğimiz yeni sürümün ise **15** olduğunu varsayarak ilerliyoruz.
 
-### 1. Yeni Sürümün Kurulumu ve İnitialize Edilmesi (initdb)
+### 1. Yeni Sürümün Kurulumu ve Initialize Edilmesi (initdb)
 
 Eski veritabanı çalışmaya devam ederken yeni sürümü sunucuya kurun ve veri dizinini (`/var/lib/pgsql/15/data/`) oluşturmak için başlatın. RHEL sistemlerinde kurulumdan sonra `initdb` manuel tetiklenmelidir.
 
 ```bash
 sudo dnf install -y postgresql15-server postgresql15-contrib
 
-# Yeni cluster'ı initialize ediyoruz
-sudo /usr/pgsql-15/bin/postgresql-15-setup initdb
+# Eski cluster'ın encoding / locale / checksum ayarlarını kontrol edin
+sudo -u postgres psql -c "SELECT datname, pg_encoding_to_char(encoding), datcollate, datctype FROM pg_database;"
+sudo -u postgres psql -c "SHOW data_checksums;"
+
+# Yeni cluster'ı initialize ediyoruz (ayarlar eskiyle aynı olmalı, örnek:)
+sudo PGSETUP_INITDB_OPTIONS="--encoding=UTF8 --locale=en_US.UTF-8" /usr/pgsql-15/bin/postgresql-15-setup initdb
 ```
+
+> **⚠️ Not:** Yeni cluster'ın encoding, locale ve `data_checksums` ayarları eski cluster ile aynı olmalıdır; aksi halde `pg_upgrade -c` kontrolü hata verir. Eski cluster'da checksum açıksa `PGSETUP_INITDB_OPTIONS` içine `--data-checksums` ekleyin.
 
 ### 2. Servislerin Durdurulması
 
@@ -66,7 +72,8 @@ Kontrol başarılıysa, `-c` (check) parametresini kaldırıp işlemi başlatın
   --link
 ```
 
-> **💡 Uzman Notu (`--link` Nasıl Çalışır?):** > `--link` parametresi kullanıldığında dahi yeni bir data directory (`-D`) belirtmek zorunludur çünkü PostgreSQL'in yeni sürümü kendi yeni sistem kataloglarına ihtiyaç duyar. `--link`, veri dosyalarını kopyalamak yerine işletim sistemi seviyesinde **"Hard Link"** oluşturur. Yani eski ve yeni dizindeki dosyalar diskin üzerindeki aynı fiziksel alana (inode) işaret eder.
+> **💡 Uzman Notu (`--link` Nasıl Çalışır?):**
+> `--link` parametresi kullanıldığında dahi yeni bir data directory (`-D`) belirtmek zorunludur çünkü PostgreSQL'in yeni sürümü kendi yeni sistem kataloglarına ihtiyaç duyar. `--link`, veri dosyalarını kopyalamak yerine işletim sistemi seviyesinde **"Hard Link"** oluşturur. Yani eski ve yeni dizindeki dosyalar diskin üzerindeki aynı fiziksel alana (inode) işaret eder.
 >
 > **⚠️ KRİTİK UYARI:** Hard link kullanıldığı için dosyalar ortaktır. Yükseltme tamamlanıp yeni sunucu (v15) başlatıldıktan sonra, eski sunucuyu (v12) **ASLA** tekrar başlatmayın. Aksi takdirde veri dosyaları bozulabilir.
 
@@ -74,14 +81,14 @@ Kontrol başarılıysa, `-c` (check) parametresini kaldırıp işlemi başlatın
 
 Yeni sürüm, kendi varsayılan `postgresql.conf` ve `pg_hba.conf` ayarlarıyla (standart 5432 portu vs.) kurulmuştur. Eski sürümdeki (`/var/lib/pgsql/12/data/`) özel memory ayarlarınızı (shared_buffers, work_mem vs.) ve erişim kurallarınızı yeni konfigürasyon dosyalarına dikkatlice aktarın.
 
-Eski sunucunun `postgresql.conf` dosyasını doğrudan kopyalamayın, sadece değiştirdiğiniz parametreleri yeni dosyaya uyarlayın.
+Eski sunucunun `postgresql.conf` dosyasını doğrudan kopyalamayın, sadece değiştirdiğiniz parametreleri yeni dosyaya uyarlayın. `ALTER SYSTEM` ile yapılmış ayarlar için eski dizindeki `postgresql.auto.conf` dosyasını da kontrol edin.
 
 ### 6. Yeni Servisi Başlatma ve İstatistikleri Güncelleme
 
-Yeni servisi başlatın. Yükseltme işlemi sonrasında Query Planner'ın doğru çalışabilmesi için veritabanı istatistiklerinin yeniden toplanması gerekir. `pg_upgrade` işlemi sonrasında `postgres` kullanıcısının bulunduğu dizine bunun için bir script bırakılır.
+Yeni servisi başlatın. `pg_upgrade` optimizer istatistiklerini taşımaz; Query Planner'ın doğru çalışabilmesi için istatistiklerin yeniden toplanması gerekir. PostgreSQL 14 ve sonrasında `analyze_new_cluster.sh` scripti artık oluşturulmaz, bunun yerine `vacuumdb` kullanılır.
 
 ```bash
-# root kullanıcısına dönüp servisi başlatın
+# postgres kullanıcısından çıkıp servisi başlatın
 exit
 sudo systemctl enable postgresql-15
 sudo systemctl start postgresql-15
@@ -89,7 +96,10 @@ sudo systemctl disable postgresql-12
 
 # İstatistikleri toplayın (yeniden postgres kullanıcısına geçerek)
 sudo su - postgres
-./analyze_new_cluster.sh
+/usr/pgsql-15/bin/vacuumdb --all --analyze-in-stages
+
+# pg_upgrade eklenti güncellemesi gerekiyorsa update_extensions.sql oluşturur
+[ -f update_extensions.sql ] && psql -f update_extensions.sql
 ```
 
 ### 7. Eski Cluster'ı Temizleme (Opsiyonel)
