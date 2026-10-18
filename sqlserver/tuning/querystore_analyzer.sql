@@ -2,12 +2,12 @@
    QUERY STORE ANALYZER — SQL Server 2017+
    ----------------------------------------------------------------------------
    Combines these scripts into one parameterized script:
-     - querystore_cost_rankings.sql     -> Result 1
-     - 24h_summary_runtime.sql          -> Result 2
-     - query_id_spec_cost_rankings.sql  -> Result 3
-     - cpu_percentage_inspection.sql    -> Result 4
-     - 24h_wait_breakdown.sql           -> Result 5
-     - get_query_and_planxml.sql        -> Result 6
+     - querystore_cost_rankings_deprecated.sql     -> Result 1
+     - 24h_summary_runtime_deprecated.sql          -> Result 2
+     - query_id_spec_cost_rankings_deprecated.sql  -> Result 3
+     - cpu_percentage_inspection_deprecated.sql    -> Result 4
+     - 24h_wait_breakdown_deprecated.sql           -> Result 5
+     - get_query_and_planxml_deprecated.sql        -> Result 6
 
    RESULT SETS:
      1. Query ranking (query level, Top N or selected query_ids)
