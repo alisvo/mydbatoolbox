@@ -1,5 +1,8 @@
 
-SELECT p.pid, p.phase,
+SELECT p.pid, p.datname,
+       p.relid::regclass       AS table_name,
+       p.index_relid::regclass AS index_name,
+       p.command, p.phase,
        round(100.0 * p.blocks_done / nullif(p.blocks_total, 0), 1) AS pct,
        p.lockers_done, p.lockers_total, p.current_locker_pid,
        a.query AS waiting_for
