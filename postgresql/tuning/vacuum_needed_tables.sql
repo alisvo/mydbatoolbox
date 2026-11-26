@@ -1,110 +1,208 @@
-WITH cfg AS (
-    SELECT current_setting('autovacuum_vacuum_threshold')::float8           AS vac_base,
-           current_setting('autovacuum_vacuum_scale_factor')::float8        AS vac_scale,
-           current_setting('autovacuum_vacuum_insert_threshold')::float8    AS ins_base,
-           current_setting('autovacuum_vacuum_insert_scale_factor')::float8 AS ins_scale,
-           current_setting('autovacuum_analyze_threshold')::float8          AS ana_base,
-           current_setting('autovacuum_analyze_scale_factor')::float8       AS ana_scale,
-           current_setting('autovacuum_freeze_max_age')::float8             AS freeze_max
-),
-t AS (
-    SELECT c.oid,
-           n.nspname  AS schema_name,
-           c.relname  AS table_name,
-           c.relkind,
-           c.reltuples,
-           c.relpages,
-           c.relallvisible,
-           CASE WHEN c.relkind IN ('r', 'm') THEN age(c.relfrozenxid) END AS xid_age,
-           s.n_live_tup,
-           s.n_dead_tup,
-           s.n_mod_since_analyze,
-           s.n_ins_since_vacuum,
-           greatest(s.last_vacuum,  s.last_autovacuum)  AS last_any_vacuum,
-           greatest(s.last_analyze, s.last_autoanalyze) AS last_any_analyze,
-           (SELECT count(DISTINCT ps.attname) FROM pg_stats ps
-             WHERE ps.schemaname = n.nspname AND ps.tablename = c.relname)      AS stats_cols,
-           (SELECT count(*) FROM pg_attribute a
-             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped)  AS total_cols,
-           EXISTS (SELECT 1 FROM pg_stat_progress_vacuum p WHERE p.relid = c.oid) AS vacuum_running,
-           opt.*
+WITH table_options AS (
+    SELECT
+        c.oid AS relid,
+
+        COALESCE(
+            (MAX(opt.option_value) FILTER (WHERE opt.option_name = 'autovacuum_enabled'))::boolean,
+            true
+        ) AS autovacuum_enabled,
+
+        COALESCE(
+            (MAX(opt.option_value) FILTER (WHERE opt.option_name = 'autovacuum_vacuum_threshold'))::numeric,
+            current_setting('autovacuum_vacuum_threshold')::numeric
+        ) AS autovacuum_vacuum_threshold,
+
+        COALESCE(
+            (MAX(opt.option_value) FILTER (WHERE opt.option_name = 'autovacuum_vacuum_scale_factor'))::numeric,
+            current_setting('autovacuum_vacuum_scale_factor')::numeric
+        ) AS autovacuum_vacuum_scale_factor,
+
+        COALESCE(
+            (MAX(opt.option_value) FILTER (WHERE opt.option_name = 'autovacuum_analyze_threshold'))::numeric,
+            current_setting('autovacuum_analyze_threshold')::numeric
+        ) AS autovacuum_analyze_threshold,
+
+        COALESCE(
+            (MAX(opt.option_value) FILTER (WHERE opt.option_name = 'autovacuum_analyze_scale_factor'))::numeric,
+            current_setting('autovacuum_analyze_scale_factor')::numeric
+        ) AS autovacuum_analyze_scale_factor
+
     FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
-    LEFT JOIN LATERAL (
-        SELECT  max(option_value) FILTER (WHERE option_name = 'autovacuum_enabled')                          AS o_av_enabled,
-               (max(option_value) FILTER (WHERE option_name = 'autovacuum_vacuum_threshold'))::float8        AS o_vac_base,
-               (max(option_value) FILTER (WHERE option_name = 'autovacuum_vacuum_scale_factor'))::float8     AS o_vac_scale,
-               (max(option_value) FILTER (WHERE option_name = 'autovacuum_vacuum_insert_threshold'))::float8 AS o_ins_base,
-               (max(option_value) FILTER (WHERE option_name = 'autovacuum_vacuum_insert_scale_factor'))::float8 AS o_ins_scale,
-               (max(option_value) FILTER (WHERE option_name = 'autovacuum_analyze_threshold'))::float8       AS o_ana_base,
-               (max(option_value) FILTER (WHERE option_name = 'autovacuum_analyze_scale_factor'))::float8    AS o_ana_scale,
-               (max(option_value) FILTER (WHERE option_name = 'autovacuum_freeze_max_age'))::float8          AS o_freeze_max
-        FROM pg_options_to_table(c.reloptions)
-    ) opt ON true
-    WHERE c.relkind IN ('r', 'p', 'm')
-      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-      AND n.nspname NOT LIKE 'pg\_%'
+    LEFT JOIN LATERAL pg_options_to_table(c.reloptions) opt ON true
+    GROUP BY c.oid
 ),
-d AS (
-    SELECT t.*,
-           coalesce(o_vac_base, vac_base) + coalesce(o_vac_scale, vac_scale) * greatest(reltuples, 0) AS vac_thresh,
-           coalesce(o_ins_base, ins_base)                                                             AS ins_base_eff,
-           coalesce(o_ins_base, ins_base) + coalesce(o_ins_scale, ins_scale) * greatest(reltuples, 0) AS ins_thresh,
-           coalesce(o_ana_base, ana_base) + coalesce(o_ana_scale, ana_scale) * greatest(reltuples, 0) AS ana_thresh,
-           least(coalesce(o_freeze_max, freeze_max), freeze_max)                                      AS freeze_max_eff
-    FROM t CROSS JOIN cfg
+base AS (
+    SELECT
+        s.relid,
+        s.schemaname AS schema_name,
+        s.relname AS table_name,
+
+        pg_relation_size(s.relid) AS table_bytes,
+        pg_total_relation_size(s.relid) AS total_bytes,
+
+        s.n_live_tup::numeric AS n_live_tup,
+        s.n_dead_tup::numeric AS n_dead_tup,
+        s.n_mod_since_analyze::numeric AS n_mod_since_analyze,
+        c.reltuples AS reltuples,
+
+        s.last_vacuum,
+        s.last_autovacuum,
+        s.last_analyze,
+        s.last_autoanalyze,
+
+        s.vacuum_count,
+        s.autovacuum_count,
+        s.analyze_count,
+        s.autoanalyze_count,
+
+        o.autovacuum_enabled,
+
+        (
+            o.autovacuum_vacuum_threshold
+            + o.autovacuum_vacuum_scale_factor * GREATEST(c.reltuples::numeric, 0)
+        ) AS vacuum_threshold_tuples,
+
+        (
+            o.autovacuum_analyze_threshold
+            + o.autovacuum_analyze_scale_factor * GREATEST(c.reltuples::numeric, 0)
+        ) AS analyze_threshold_tuples
+
+    FROM pg_stat_user_tables s
+    JOIN pg_class c ON c.oid = s.relid
+    JOIN table_options o ON o.relid = s.relid
+    WHERE c.relkind IN ('r', 'm')
 ),
-e AS (
-    SELECT d.*,
-           coalesce(n_dead_tup > vac_thresh, false)                                  AS need_vac_dead,
-           coalesce(ins_base_eff >= 0 AND n_ins_since_vacuum > ins_thresh, false)    AS need_vac_ins,
-           coalesce(xid_age > 0.8 * freeze_max_eff, false)                           AS need_vac_freeze,
-           (relkind = 'p' AND stats_cols = 0)                                        AS miss_part,
-           ((relkind <> 'p' AND reltuples > 0 AND stats_cols = 0)
-             OR (reltuples = -1 AND coalesce(n_live_tup, 0) > 0))                    AS miss_stats,
-           (reltuples > 0 AND stats_cols > 0 AND stats_cols < total_cols)            AS partial_stats,
-           coalesce(n_mod_since_analyze > ana_thresh, false)                         AS stale_stats
-    FROM d
-),
-f AS (
-    SELECT e.*,
-           (need_vac_dead OR need_vac_ins OR need_vac_freeze)             AS need_vac,
-           (miss_part OR miss_stats OR partial_stats OR stale_stats)      AS need_analyze,
-           concat_ws(', ',
-               CASE WHEN need_vac_freeze        THEN 'ACİL: wraparound yaklaşıyor' END,
-               CASE WHEN o_av_enabled::boolean IS FALSE THEN 'autovacuum bu tabloda kapalı' END,
-               CASE WHEN need_vac_dead          THEN 'dead tuple eşiği aşıldı' END,
-               CASE WHEN need_vac_ins           THEN 'insert eşiği aşıldı' END,
-               CASE WHEN miss_part              THEN 'partitioned: elle ANALYZE gerekir' END,
-               CASE WHEN miss_stats             THEN 'istatistik yok' END,
-               CASE WHEN partial_stats          THEN 'bazı kolon istatistikleri eksik' END,
-               CASE WHEN stale_stats            THEN 'istatistik eskimiş' END
-           ) AS reasons
-    FROM e
+scored AS (
+    SELECT
+        *,
+
+        ROUND(
+            100.0 * n_dead_tup
+            / NULLIF(n_live_tup + n_dead_tup, 0),
+            2
+        ) AS dead_tuple_pct,
+
+        ROUND(
+            100.0 * n_mod_since_analyze
+            / NULLIF(n_live_tup, 0),
+            2
+        ) AS mod_since_analyze_pct,
+
+        (
+            n_dead_tup >= 10000
+            AND
+            100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0) >= 10
+        ) AS high_dead_tuple_ratio,
+
+        (
+            n_dead_tup >= vacuum_threshold_tuples
+        ) AS over_vacuum_threshold,
+
+        (
+            last_analyze IS NULL
+            AND last_autoanalyze IS NULL
+            AND n_live_tup > 0
+            AND reltuples <= 0
+        ) AS never_analyzed,
+
+        (
+            n_mod_since_analyze >= analyze_threshold_tuples
+        ) AS over_analyze_threshold,
+
+        (
+            n_mod_since_analyze >= 10000
+            AND
+            100.0 * n_mod_since_analyze / NULLIF(n_live_tup, 0) >= 10
+        ) AS high_mod_since_analyze_ratio
+
+    FROM base
 )
-SELECT reasons,
-       schema_name,
-       table_name,
-       pg_size_pretty(pg_relation_size(oid))                                       AS table_size,
-       n_live_tup,
-       n_dead_tup,
-       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2)           AS dead_pct,
-       round((n_dead_tup / nullif(vac_thresh, 0))::numeric, 2)                     AS dead_vs_thresh,
-       n_ins_since_vacuum,
-       n_mod_since_analyze,
-       xid_age,
-       round((100.0 * xid_age / freeze_max_eff)::numeric, 1)                       AS xid_pct,
-       round((100.0 * relallvisible / nullif(relpages, 0))::numeric, 1)            AS vm_pct,
-       last_any_vacuum,
-       last_any_analyze,
-       vacuum_running,
-       CASE
-         WHEN vacuum_running            THEN '-- şu an vacuum çalışıyor, bitmesini bekleyin'
-         WHEN need_vac AND need_analyze THEN format('VACUUM (ANALYZE) %I.%I;', schema_name, table_name)
-         WHEN need_vac                  THEN format('VACUUM %I.%I;',           schema_name, table_name)
-         WHEN need_analyze              THEN format('ANALYZE %I.%I;',          schema_name, table_name)
-       END AS command
-FROM f
-WHERE reasons <> ''
-ORDER BY need_vac_freeze DESC, need_vac DESC, need_analyze DESC, pg_relation_size(oid) DESC;
+SELECT
+    current_database() AS database_name,
+    schema_name,
+    table_name,
+
+    pg_size_pretty(table_bytes) AS table_size,
+    pg_size_pretty(total_bytes) AS total_size_with_indexes,
+
+    n_live_tup::bigint AS estimated_live_tuples,
+    n_dead_tup::bigint AS estimated_dead_tuples,
+    dead_tuple_pct,
+
+    n_mod_since_analyze::bigint AS rows_changed_since_analyze,
+    mod_since_analyze_pct,
+
+    vacuum_threshold_tuples::bigint AS estimated_vacuum_threshold,
+    analyze_threshold_tuples::bigint AS estimated_analyze_threshold,
+
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze,
+
+    vacuum_count,
+    autovacuum_count,
+    analyze_count,
+    autoanalyze_count,
+
+    autovacuum_enabled,
+
+    CASE
+        WHEN autovacuum_enabled IS FALSE THEN 'CHECK_AUTOVACUUM_DISABLED'
+        WHEN (high_dead_tuple_ratio OR over_vacuum_threshold)
+             AND (never_analyzed OR over_analyze_threshold OR high_mod_since_analyze_ratio)
+            THEN 'VACUUM_ANALYZE_CANDIDATE'
+        WHEN high_dead_tuple_ratio OR over_vacuum_threshold
+            THEN 'VACUUM_CANDIDATE'
+        WHEN never_analyzed OR over_analyze_threshold OR high_mod_since_analyze_ratio
+            THEN 'ANALYZE_CANDIDATE'
+        ELSE 'REVIEW'
+    END AS maintenance_suggestion,
+
+    concat_ws(
+        ', ',
+        CASE WHEN autovacuum_enabled IS FALSE THEN 'autovacuum disabled on table' END,
+        CASE WHEN high_dead_tuple_ratio THEN 'dead tuple ratio >= 10% and dead tuples >= 10000' END,
+        CASE WHEN over_vacuum_threshold THEN 'estimated autovacuum vacuum threshold exceeded' END,
+        CASE WHEN never_analyzed THEN 'table has never been analyzed' END,
+        CASE WHEN over_analyze_threshold THEN 'estimated autovacuum analyze threshold exceeded' END,
+        CASE WHEN high_mod_since_analyze_ratio THEN 'changed rows since analyze >= 10% and >= 10000 rows' END
+    ) AS reason,
+
+    CASE
+        WHEN (high_dead_tuple_ratio OR over_vacuum_threshold)
+             AND (never_analyzed OR over_analyze_threshold OR high_mod_since_analyze_ratio)
+            THEN format('VACUUM (ANALYZE, VERBOSE) %I.%I;', schema_name, table_name)
+
+        WHEN high_dead_tuple_ratio OR over_vacuum_threshold
+            THEN format('VACUUM (VERBOSE) %I.%I;', schema_name, table_name)
+
+        WHEN never_analyzed OR over_analyze_threshold OR high_mod_since_analyze_ratio
+            THEN format('ANALYZE VERBOSE %I.%I;', schema_name, table_name)
+
+        ELSE NULL
+    END AS suggested_command
+
+FROM scored
+WHERE
+       autovacuum_enabled IS FALSE
+    OR high_dead_tuple_ratio
+    OR over_vacuum_threshold
+    OR never_analyzed
+    OR over_analyze_threshold
+    OR high_mod_since_analyze_ratio
+ORDER BY
+    CASE
+        WHEN autovacuum_enabled IS FALSE THEN 1
+        WHEN (high_dead_tuple_ratio OR over_vacuum_threshold)
+             AND (never_analyzed OR over_analyze_threshold OR high_mod_since_analyze_ratio)
+            THEN 2
+        WHEN high_dead_tuple_ratio OR over_vacuum_threshold
+            THEN 3
+        WHEN never_analyzed OR over_analyze_threshold OR high_mod_since_analyze_ratio
+            THEN 4
+        ELSE 5
+    END,
+    total_bytes DESC,
+    dead_tuple_pct DESC NULLS LAST,
+    n_dead_tup DESC;
