@@ -52,7 +52,7 @@ d AS (
            coalesce(o_ins_base, ins_base)                                                             AS ins_base_eff,
            coalesce(o_ins_base, ins_base) + coalesce(o_ins_scale, ins_scale) * greatest(reltuples, 0) AS ins_thresh,
            coalesce(o_ana_base, ana_base) + coalesce(o_ana_scale, ana_scale) * greatest(reltuples, 0) AS ana_thresh,
-           coalesce(o_freeze_max, freeze_max)                                                         AS freeze_max_eff
+           least(coalesce(o_freeze_max, freeze_max), freeze_max)                                      AS freeze_max_eff
     FROM t CROSS JOIN cfg
 ),
 e AS (
@@ -73,7 +73,7 @@ f AS (
            (miss_part OR miss_stats OR partial_stats OR stale_stats)      AS need_analyze,
            concat_ws(', ',
                CASE WHEN need_vac_freeze        THEN 'ACİL: wraparound yaklaşıyor' END,
-               CASE WHEN o_av_enabled = 'false' THEN 'autovacuum bu tabloda kapalı' END,
+               CASE WHEN o_av_enabled::boolean IS FALSE THEN 'autovacuum bu tabloda kapalı' END,
                CASE WHEN need_vac_dead          THEN 'dead tuple eşiği aşıldı' END,
                CASE WHEN need_vac_ins           THEN 'insert eşiği aşıldı' END,
                CASE WHEN miss_part              THEN 'partitioned: elle ANALYZE gerekir' END,
