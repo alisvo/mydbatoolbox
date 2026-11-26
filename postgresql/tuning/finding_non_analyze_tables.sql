@@ -21,7 +21,7 @@ WITH t AS (
 ),
 d AS (
     SELECT *,
-           round(100.0 * n_mod_since_analyze / nullif(n_live_tup, 0), 1) AS mod_pct,
+           round((100.0 * n_mod_since_analyze / nullif(greatest(reltuples, n_live_tup), 0))::numeric, 1) AS mod_pct,
            CASE
              WHEN relkind = 'p' AND stats_cols = 0
                   THEN '1-partitioned: autovacuum analiz etmez, elle ANALYZE gerekir'
@@ -31,7 +31,8 @@ d AS (
                   THEN '3-satır var ama kolon istatistiği yok'
              WHEN stats_cols < total_cols AND reltuples > 0
                   THEN '4-bazı kolonların istatistiği eksik'
-             WHEN n_mod_since_analyze > 0.2 * nullif(n_live_tup, 0)
+             WHEN n_mod_since_analyze >= current_setting('autovacuum_analyze_threshold')::int
+                  AND n_mod_since_analyze > 0.2 * greatest(reltuples, n_live_tup)
                   THEN '5-eskimiş (son analizden beri %20+ değişiklik)'
              WHEN reltuples = -1
                   THEN '6-hiç analiz edilmemiş (boş tablo, önemsiz)'
