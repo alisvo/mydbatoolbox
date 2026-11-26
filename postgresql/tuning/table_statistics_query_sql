@@ -1,4 +1,5 @@
-SELECT s.relname,
+SELECT s.schemaname,
+       s.relname,
        pg_size_pretty(pg_total_relation_size(s.relid))                   AS total_size,
        pg_size_pretty(pg_relation_size(s.relid))                         AS table_size,
        pg_size_pretty(pg_indexes_size(s.relid))                          AS index_size,
