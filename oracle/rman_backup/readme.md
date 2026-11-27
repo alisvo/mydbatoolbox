@@ -78,7 +78,16 @@ nohup /home/oracle/scripts/rman_backup.sh /home/oracle/scripts/config/mydb.cfg l
 ```
 
 Script hata durumunda stderr'e yazar ve sıfırdan farklı kodla çıkar; crontab'da `MAILTO` tanımlıysa e-posta gelir.
+Başarılı çalışmalarda ekrana bir şey yazmaz (RMAN çıktısı sadece loga gider), yani gereksiz mail gelmez.
 Loglar: `LOG_DIR/<SID>_<mod>_<tarih>.log`, `LOG_RET` günden eskiler otomatik silinir.
+
+### Logda görülebilecek normal uyarılar
+
+| Uyarı | Anlamı |
+|---|---|
+| `RMAN-08120: archived log not deleted, not yet applied by standby` | Data Guard deletion policy çalışıyor; log standby'a uygulanınca sonraki çalışmada silinir. |
+| `RMAN-07554: CONTROL_FILE_RECORD_KEEP_TIME is too large` | Keep time recovery window'a göre büyük; haftalık KEEP backup kayıtları için bilerek büyük tutuluyor. |
+| `RMAN-07553: RECOVERY WINDOW is more than CONTROL_FILE_RECORD_KEEP_TIME` | **Normal değil:** `control_file_record_keep_time` ön koşulu yapılmamış. |
 
 ---
 

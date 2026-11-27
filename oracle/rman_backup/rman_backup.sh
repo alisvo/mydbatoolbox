@@ -115,7 +115,8 @@ esac
 
 # ------------------------------- Çalıştır -------------------------------------
 log "START: mode=$MODE"
-rman target / nocatalog msglog="$LOG_FILE" append <<EOF
+# Çıktı msglog'a gider; stdout'u susturuyoruz ki cron her çalışmada mail atmasın.
+rman target / nocatalog msglog="$LOG_FILE" append >/dev/null <<EOF
 ${CONFIG_CMDS}
 ${RMAN_CMDS}
 EXIT;
